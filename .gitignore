@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+out/
+.venv/
+venv/
+pico/secrets.py
+docs/walkthrough.md
