@@ -33,7 +33,7 @@ import argparse
 import json
 
 import numpy as np
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 
 # Canvas tap cadence — 34/33ms is the empirical reliable floor.
 PRESS = 0.034
@@ -155,6 +155,84 @@ def quantize(img: Image.Image, palette: np.ndarray, use_oklab: bool = False):
     indices = np.argmin(dists, axis=1).reshape(arr.shape[:2])
     mask = alpha >= ALPHA_THRESHOLD
     return indices, mask
+
+
+# Candidate brush sets evaluated independently for each color when per_color=True.
+# Mirrors the global auto-picker's candidate list so any option the global picker
+# could choose, the per-color picker can choose for any individual color.
+_PER_COLOR_CANDIDATES = (
+    ("3x3", "1x1"),
+    ("plus", "1x1"),
+    ("3x3", "plus", "1x1"),
+    ("1x1",),
+)
+
+
+def _eval_brush_set(start, own, overstampable, brush_set, prior_brush):
+    """Estimate wall-clock cost of painting `own` with a given brush priority.
+    Returns (cost_seconds, end_cursor, end_brush). Matches the real emit-path
+    tiling (tile_color_pixels + MIN_TILES demotion) and a greedy-NN tour for
+    travel — no 2-opt, to keep per-candidate-per-color evaluation fast."""
+    by_brush = tile_color_pixels(own, overstampable, list(brush_set))
+    for b in list(by_brush):
+        if b == "1x1":
+            continue
+        if len(by_brush[b]) < MIN_TILES.get(b, 1):
+            del by_brush[b]
+    stamp_s = STAMP_PRESS + STAMP_PAUSE + PRESS_OVERHEAD
+    travel_s = PRESS + PAUSE + PRESS_OVERHEAD
+    brush_switch_s = 4.0
+    cur = start
+    total = 0.0
+    cur_brush = prior_brush
+    for b in brush_set:
+        anchors = by_brush.get(b, [])
+        if not anchors:
+            continue
+        if b != cur_brush:
+            total += brush_switch_s
+            cur_brush = b
+        pts = np.asarray(anchors, dtype=np.int32)
+        n = len(pts)
+        visited = np.zeros(n, dtype=bool)
+        INF = np.iinfo(np.int32).max
+        cur_x, cur_y = np.int32(cur[0]), np.int32(cur[1])
+        travel_cells = 0
+        for _ in range(n):
+            d = np.maximum(np.abs(pts[:, 0] - cur_x),
+                           np.abs(pts[:, 1] - cur_y))
+            d[visited] = INF
+            k = int(d.argmin())
+            travel_cells += int(d[k])
+            visited[k] = True
+            cur_x, cur_y = pts[k, 0], pts[k, 1]
+        cur = (int(cur_x), int(cur_y))
+        total += travel_cells * travel_s
+        total += n * stamp_s
+    return total, cur, cur_brush
+
+
+def _pick_per_color_brushes(pixels_by_color, color_order, later):
+    """For each color, evaluate every candidate brush set and keep the
+    cheapest. Returns a list parallel to color_order — each entry is the brush
+    priority list to use for that color's tiling. Threads cursor + current
+    brush state through so each pick sees the realistic incoming state."""
+    cx, cy = 128, 128
+    cur_brush = INITIAL_BRUSH
+    picks: list[list[str]] = []
+    for idx, color in enumerate(color_order):
+        own = pixels_by_color[color]
+        overstampable = set(own) | later[idx]
+        best = None
+        for cs in _PER_COLOR_CANDIDATES:
+            cost, end_cur, end_brush = _eval_brush_set(
+                (cx, cy), own, overstampable, cs, cur_brush)
+            if best is None or cost < best[0]:
+                best = (cost, end_cur, end_brush, list(cs))
+        picks.append(best[3])
+        cx, cy = best[1]
+        cur_brush = best[2]
+    return picks
 
 
 def _first_used_brush(pixels_by_color, color_order, brushes):
@@ -611,6 +689,7 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
              contrast: float = 1.0,
              sharpness: float = 1.0,
              brushes: list[str] | None = None,
+             per_color: bool = False,
              use_oklab: bool = False,
              write_outputs: bool = True,
              debug: bool = False) -> dict:
@@ -630,8 +709,16 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         palette_path = image_path.parent / "palette.json"
     palette = load_palette(palette_path)
 
-    img = Image.open(image_path).convert("RGBA").resize(
-        (target_size, target_size), Image.LANCZOS
+    # Preserve aspect ratio: fit within target_size × target_size and pad any
+    # remaining space with transparent pixels. Non-square sources (e.g. a book
+    # cover sized to the 180×256 in-game book canvas) are centered rather than
+    # stretched to a square; the transparent padding drops out of the mask so
+    # no stamps are emitted for those cells.
+    img = ImageOps.pad(
+        Image.open(image_path).convert("RGBA"),
+        (target_size, target_size),
+        method=Image.LANCZOS,
+        color=(0, 0, 0, 0),
     )
     if contrast != 1.0 or saturation != 1.0 or sharpness != 1.0:
         # Adjust on RGB only; preserve alpha so transparent regions stay
@@ -668,7 +755,28 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
     # but needed here to pick the right initial brush for the preamble).
     color_order = sorted(pixels_by_color,
                          key=lambda c: -len(pixels_by_color[c]))
-    initial_brush = _first_used_brush(pixels_by_color, color_order, brushes)
+
+    # Precompute cumulative "later color" pixel sets so overstamp tiling for
+    # color_order[i] knows which cells it's allowed to paint over. `later[i]`
+    # = union of pixels for color_order[i+1 .. ]. Computed here (before the
+    # initial-brush peek) so the per-color brush picker can see it.
+    later: list[set[tuple[int, int]]] = [set()] * len(color_order)
+    acc: set[tuple[int, int]] = set()
+    for i in range(len(color_order) - 1, -1, -1):
+        later[i] = set(acc)
+        acc.update(pixels_by_color[color_order[i]])
+
+    # When per_color is set, each color gets its own brush priority list
+    # picked by dry-running every candidate against that color's pixel set.
+    # The global `brushes` parameter is ignored in this mode.
+    per_color_brushes: list[list[str]] | None = None
+    if per_color:
+        per_color_brushes = _pick_per_color_brushes(
+            pixels_by_color, color_order, later)
+        first_brushes = per_color_brushes[0] if per_color_brushes else ["1x1"]
+    else:
+        first_brushes = brushes
+    initial_brush = _first_used_brush(pixels_by_color, color_order, first_brushes)
 
     builder = MacroBuilder(initial_brush=initial_brush)
     # Assume the Pico prelude parks the cursor at canvas center (128, 128).
@@ -677,7 +785,7 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
     cx, cy = 128, 128                     # canvas cursor (absolute, not relative)
     px, py = palette_xy(INITIAL_PALETTE_IDX)  # palette cursor
     stamps = 0                            # A-presses on canvas (multi-cell w/ bigger brushes)
-    pixels_drawn = 0                      # total cells painted
+    covered: set[tuple[int, int]] = set() # unique canvas cells hit by a stamp footprint
     switches = 0
 
     # Color order was computed above (needed for initial_brush peek).
@@ -691,49 +799,64 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
     def order_pixels(start: tuple[int, int], pts: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        # Greedy nearest-neighbor seed, then 2-opt until no improvement.
-        remaining = pts[:]
-        tour: list[tuple[int, int]] = []
-        cur = start
-        while remaining:
-            i = min(range(len(remaining)), key=lambda k: cheby(remaining[k], cur))
-            cur = remaining.pop(i)
-            tour.append(cur)
+        # Greedy nearest-neighbor seed + 2-opt refinement. Vectorized because
+        # this is the inner loop of the whole generator — every pixel of every
+        # color group passes through here.
+        if not pts:
+            return []
+        pts_arr = np.asarray(pts, dtype=np.int32)
+        n = len(pts_arr)
+        visited = np.zeros(n, dtype=bool)
+        tour_idx = np.empty(n, dtype=np.int64)
+        cx0, cy0 = start
+        cur_x, cur_y = np.int32(cx0), np.int32(cy0)
+        INF = np.iinfo(np.int32).max
+        for step in range(n):
+            d = np.maximum(np.abs(pts_arr[:, 0] - cur_x),
+                           np.abs(pts_arr[:, 1] - cur_y))
+            d[visited] = INF
+            k = int(d.argmin())
+            tour_idx[step] = k
+            visited[k] = True
+            cur_x, cur_y = pts_arr[k, 0], pts_arr[k, 1]
+        tour_arr = pts_arr[tour_idx].copy()
 
-        # 2-opt is O(n²) per pass and runs until convergence — on dense blocks
-        # (thousands of pixels in one color) this blows up. Greedy NN is already
-        # near-optimal on contiguous regions, so skip 2-opt past the threshold.
-        if len(tour) > 200:
-            return tour
+        # 2-opt is O(n²) per pass and runs until convergence. Above ~500 pixels
+        # color groups are dense fills where greedy-NN is already near-optimal
+        # (every cell has a neighbor at distance 1) — skip the refinement.
+        if n > 500:
+            return [tuple(row.tolist()) for row in tour_arr]
 
+        start_arr = np.asarray(start, dtype=np.int32)
         improved = True
         while improved:
             improved = False
-            for i in range(len(tour) - 1):
-                a = tour[i - 1] if i > 0 else start
-                b = tour[i]
-                for j in range(i + 1, len(tour)):
-                    c = tour[j]
-                    d = tour[j + 1] if j + 1 < len(tour) else None
-                    # cost of edges (a-b) + (c-d) vs reversed (a-c) + (b-d)
-                    before = cheby(a, b) + (cheby(c, d) if d else 0)
-                    after = cheby(a, c) + (cheby(b, d) if d else 0)
-                    if after < before:
-                        tour[i:j + 1] = tour[i:j + 1][::-1]
-                        improved = True
-                        break
-                if improved:
+            m = n
+            for i in range(m - 1):
+                a = tour_arr[i - 1] if i > 0 else start_arr
+                b = tour_arr[i]
+                c = tour_arr[i + 1:m]
+                has_d = np.arange(i + 1, m) < (m - 1)
+                d_src = np.minimum(np.arange(i + 2, m + 1), m - 1)
+                d = tour_arr[d_src]
+                ab = max(abs(int(a[0]) - int(b[0])),
+                         abs(int(a[1]) - int(b[1])))
+                ac = np.maximum(np.abs(c[:, 0] - a[0]),
+                                np.abs(c[:, 1] - a[1]))
+                cd = np.maximum(np.abs(c[:, 0] - d[:, 0]),
+                                np.abs(c[:, 1] - d[:, 1]))
+                bd = np.maximum(np.abs(d[:, 0] - b[0]),
+                                np.abs(d[:, 1] - b[1]))
+                before = ab + np.where(has_d, cd, 0)
+                after = ac + np.where(has_d, bd, 0)
+                improving = after < before
+                if improving.any():
+                    k = int(improving.argmax())
+                    j = i + 1 + k
+                    tour_arr[i:j + 1] = tour_arr[i:j + 1][::-1]
+                    improved = True
                     break
-        return tour
-
-    # Precompute cumulative "later color" pixel sets so overstamp tiling for
-    # color_order[i] knows which cells it's allowed to paint over. `later[i]`
-    # = union of pixels for color_order[i+1 .. ].
-    later: list[set[tuple[int, int]]] = [set()] * len(color_order)
-    acc: set[tuple[int, int]] = set()
-    for i in range(len(color_order) - 1, -1, -1):
-        later[i] = set(acc)
-        acc.update(pixels_by_color[color_order[i]])
+        return [tuple(row.tolist()) for row in tour_arr]
 
     for idx, color in enumerate(color_order):
         target_px, target_py = palette_xy(color)
@@ -756,7 +879,8 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         # Overstampable cells = this color's own pixels ∪ later colors' pixels.
         own = pixels_by_color[color]
         overstampable = set(own) | later[idx]
-        by_brush = tile_color_pixels(own, overstampable, brushes)
+        brushes_here = per_color_brushes[idx] if per_color_brushes else brushes
+        by_brush = tile_color_pixels(own, overstampable, brushes_here)
         own_set = set(own)
 
         # Per-color, decide which brushes are worth the switch cost. See
@@ -779,17 +903,18 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         # Emit each brush's sub-tour in priority order. Start each sub-tour
         # from current cursor so the 2-opt/NN ordering naturally picks the
         # nearest anchor first — minimizes inter-group jumps.
-        for brush in brushes:
+        for brush in brushes_here:
             anchors = by_brush.get(brush, [])
             if not anchors:
                 continue
             builder.brush_select(brush)
-            cps = len(BRUSH_PATTERNS[brush])
+            pattern = BRUSH_PATTERNS[brush]
             for col, row in order_pixels((cx, cy), anchors):
                 builder.pen_to(col - cx, row - cy)
                 cx, cy = col, row
                 stamps += 1
-                pixels_drawn += cps
+                for dx, dy in pattern:
+                    covered.add((col + dx, row + dy))
 
     macro_path = out_dir / f"{stem}_macro.mz"
     compact_lines = to_compact(builder.lines)
@@ -847,14 +972,21 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
             f"macro simulation disagrees with quantized preview at {bad} pixel(s)"
         )
 
+    if per_color_brushes:
+        # Report per-color choices by frequency: "3x3,1x1:15 plus,1x1:6 1x1:32"
+        from collections import Counter
+        counts = Counter(",".join(cs) for cs in per_color_brushes)
+        reported_brushes = ["per-color"] + [f"{k}:{v}" for k, v in counts.most_common()]
+    else:
+        reported_brushes = brushes
     info = {
         "source": image_path.name,
         "size": target_size,
-        "pixels_drawn": pixels_drawn,
-        "pixels_total": target_size * target_size,
+        "cells_covered": len(covered),
+        "canvas_cells": target_size * target_size,
         "color_switches": switches,
         "brush_switches": builder.brush_switches,
-        "brushes": brushes,
+        "brushes": reported_brushes,
         "quantizer": "oklab" if use_oklab else "rgb",
         "stamps": stamps,
         "button_presses": builder.presses,
@@ -904,32 +1036,38 @@ def main() -> None:
 
     if args.brushes == "auto":
         # Dry-run every brush combo and pick the fastest by end-to-end estimate.
+        # per-color picks the cheapest brush set INDEPENDENTLY for each color
+        # group; wins on images with mixed-topology colors (sparse dots + dense
+        # fills). Keeping the single-set candidates in the pool bounds the
+        # worst-case so per-color can't regress below the best global choice.
         from concurrent.futures import ProcessPoolExecutor
         candidates = [
-            ["1x1"],
-            ["3x3", "1x1"],
-            ["plus", "1x1"],
-            ["3x3", "plus", "1x1"],
+            ("1x1",          ["1x1"],                False),
+            ("3x3,1x1",      ["3x3", "1x1"],         False),
+            ("plus,1x1",     ["plus", "1x1"],        False),
+            ("3x3,plus,1x1", ["3x3", "plus", "1x1"], False),
+            ("per-color",    ["3x3", "plus", "1x1"], True),
         ]
         with ProcessPoolExecutor(max_workers=len(candidates)) as pool:
             futures = [
                 pool.submit(generate, args.image, CANVAS_SIZE,
                             suffix=args.suffix, saturation=args.saturation,
                             contrast=args.contrast, sharpness=args.sharpness,
-                            brushes=cfg, use_oklab=use_oklab,
+                            brushes=cfg, per_color=pc, use_oklab=use_oklab,
                             write_outputs=False)
-                for cfg in candidates
+                for _, cfg, pc in candidates
             ]
-            results = [(f.result()["estimated_seconds"], cfg)
-                       for f, cfg in zip(futures, candidates)]
+            results = [(f.result()["estimated_seconds"], label, cfg, pc)
+                       for f, (label, cfg, pc) in zip(futures, candidates)]
         results.sort()
         print("Auto-brush evaluation:")
-        winner_cfg = results[0][1]
-        for secs, cfg in results:
-            mark = "* " if cfg == winner_cfg else "  "
-            print(f"  {mark}{','.join(cfg):20s}  {secs:.0f}s ({secs/60:.1f} min)")
-        brushes = winner_cfg
+        winner_label = results[0][1]
+        for secs, label, cfg, pc in results:
+            mark = "* " if label == winner_label else "  "
+            print(f"  {mark}{label:20s}  {secs:.0f}s ({secs/60:.1f} min)")
+        _, _, brushes, per_color_flag = results[0]
     else:
+        per_color_flag = False
         brushes = [b.strip() for b in args.brushes.split(",") if b.strip()]
         unknown = [b for b in brushes if b not in BRUSH_PATTERNS]
         if unknown:
@@ -939,10 +1077,11 @@ def main() -> None:
     info = generate(args.image, CANVAS_SIZE, suffix=args.suffix,
                     saturation=args.saturation, contrast=args.contrast,
                     sharpness=args.sharpness, brushes=brushes,
+                    per_color=per_color_flag,
                     use_oklab=use_oklab, debug=args.debug)
     print(f"Source:           {info['source']} -> {info['size']}x{info['size']}")
-    print(f"Pixels drawn:     {info['pixels_drawn']}/{info['pixels_total']} "
-          f"({100*info['pixels_drawn']/info['pixels_total']:.1f}%)")
+    print(f"Coverage:         {info['cells_covered']}/{info['canvas_cells']} "
+          f"({100*info['cells_covered']/info['canvas_cells']:.1f}%)")
     print(f"Stamps:           {info['stamps']}")
     print(f"Color switches:   {info['color_switches']}")
     print(f"Brush switches:   {info['brush_switches']}  ({','.join(info['brushes'])})")

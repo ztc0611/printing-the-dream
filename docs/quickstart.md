@@ -27,7 +27,19 @@ After the first boot the Pico disables its USB mass-storage drive (so the Switch
 python3 convert.py path/to/image.png
 ```
 
-Defaults to 256×256 (the in-game canvas size). Outputs land in `out/<name>/`:
+Defaults to 256×256 (the food canvas size). Other item types have different rectangular canvases — size your source image to match if you want to fill the item, or `convert.py` will letterbox with transparent padding (no stamps emitted for empty cells):
+
+| Item | Canvas |
+|---|---|
+| Food | 256×256 |
+| Books | 180×256 |
+| DVDs | 256×131 |
+| Games | 256×144 |
+| TV Shows | 256×131 |
+
+Items with non-rectangular masks aren't listed — you'll need to shape your source image to match their silhouette yourself.
+
+Outputs land in `out/<name>/`:
 
 - `<name>_macro.mz` — the binary macro to load onto the Pico
 - `<name>_macro.bmp` — the quantized thumbnail the UI shows

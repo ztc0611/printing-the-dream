@@ -639,18 +639,9 @@ def run_macro(dev, macro_path, progress_cb=None, cancel_cb=None):
         _write(dev, NEUTRAL)
         gc.enable()
         _cancel_cb = None
-    # Success-only — aborts propagate through the finally above and never
-    # reach here. Best-effort push; ntfy.send swallows its own errors.
-    try:
-        import ntfy
-        stem = macro_path.rsplit("/", 1)[-1]
-        for ext in (".mz", ".txt"):
-            if stem.endswith(ext):
-                stem = stem[:-len(ext)]
-                break
-        ntfy.send("Print complete: " + stem, title="Tomodachi Printer")
-    except Exception as e:
-        print("ntfy hook failed:", e)
+    # Push the progress bar to 100% before returning. Post-completion work
+    # (notifications, etc.) is the UI's responsibility — it can swap the
+    # status text around those calls without macro_runner having to know.
     if progress_cb is not None:
         progress_cb(100, total or 1, total or 1)
     return time.monotonic() - start

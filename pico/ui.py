@@ -472,7 +472,29 @@ class UI:
             display.auto_refresh = False
         try:
             macro_runner.run_macro(self.pad, path, progress_cb, cancel_cb)
-            self.status_text = "Done: {} ({:.1f}s)".format(name, time.monotonic() - t0)
+            elapsed_s = time.monotonic() - t0
+            # Post-completion notification. Runs here (not inside run_macro)
+            # so the UI can swap the status text during the 2-5s wifi + POST
+            # window. Only fires if the user actually set up secrets.py.
+            try:
+                import ntfy
+                if ntfy.is_configured():
+                    self._status.text = "Sending notification..."
+                    if display is not None:
+                        try:
+                            display.refresh()
+                        except Exception:
+                            pass
+                    stem = name
+                    for ext in (".mz", ".txt"):
+                        if stem.endswith(ext):
+                            stem = stem[:-len(ext)]
+                            break
+                    ntfy.send("Print complete: " + stem,
+                              title="Tomodachi Printer")
+            except Exception as e:
+                print("ntfy hook failed:", e)
+            self.status_text = "Done: {} ({:.1f}s)".format(name, elapsed_s)
         except MacroAbort:
             self.pad.neutral()
             self.status_text = "Aborted: " + name

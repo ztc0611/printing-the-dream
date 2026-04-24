@@ -6,3 +6,4 @@ out/
 venv/
 pico/secrets.py
 docs/walkthrough.md
+masks/
