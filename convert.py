@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
 convert.py — turn a PNG into a macro that draws it in the Tomodachi Life item
-creator. Output runs on the Pico CircuitPython build in pico/.
-Color-grouped TSP-ordered path, multi-brush, skips A-press on transparent
-pixels.
+creator. Runs on the Pico CircuitPython build and the legacy Pi Zero NXBT
+runner. Color-grouped TSP-ordered path, multi-brush, skips A-press on
+transparent pixels.
 
 Usage:
-    python3 convert.py <image.png>
+    python3 convert.py <image.png> [--size N]
 
 Outputs (default):
-    <name>_macro.mz          binary macro for the Pico
-    <name>_macro.bmp         72×72 thumbnail shown by the Pico UI
+    <name>.mz                binary macro for the Pico (BMP thumbnail
+                              embedded in the MZ2 header)
     <name>_preview.png       full-res palette-snap preview (not for the Pico)
 
 Additional outputs with --debug:
     <name>_simulated.png     dry-run trace of what the macro will draw
-    <name>_macro_info.json   generation stats + starting-state assumptions
+    <name>.json              generation stats + starting-state assumptions
 
 Assumes when the macro starts:
   - Canvas cursor is at (128, 128) (canvas center) with the 1x1 brush.
@@ -28,44 +28,50 @@ Macro convention per pixel:
     palette cell to target cell, press A to confirm + return to drawing.
   - Press A to draw the pixel.
 """
+from collections import deque
 from pathlib import Path
 import argparse
 import json
 
 import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
+from scipy.ndimage import label as scipy_label
 
-# Canvas tap cadence — 34/33ms is the empirical reliable floor.
+# Per-press tap timing. 34/33ms is the reliable floor.
 PRESS = 0.034
 PAUSE = 0.033
-# Pre-A and post-A transitions around the canvas A-stamp.
+# Tight transitions around the canvas A-stamp.
 PRE_A_PAUSE = 0.033
 A_PAUSE = 0.033
 # STAMP combines the last move step with the A press into a single HID report
-# so the stamp lands on the destination cell — saves one press cycle per pixel.
+# (A + d-pad held in the same frame). Game applies both atomically, so the
+# stamp lands on the destination cell — saves one press cycle per pixel.
 STAMP_PRESS = 0.034
 STAMP_PAUSE = 0.033
-# Palette nav runs at the same cadence as canvas; the grid-open animation
-# (POST_PALETTE_OPEN) is what needs buffering, not the tap cadence.
+# Palette nav cadence. The bottleneck is the grid-open animation, not the
+# tap-to-tap rate (see POST_PALETTE_OPEN below).
 PALETTE_PRESS = 0.067
 PALETTE_PAUSE = 0.133
-# Brush menu runs slower: a dropped A on brush commit leaves the wrong brush
-# active, and 3x3 stamps afterward degrade to 1x1 (holes in solid fills).
-# Rare (~30 switches/print) so overkill here is cheap insurance.
+# Brush menu is slower than palette — a dropped A leaves the real brush
+# wrong and 3x3 stamps degrade to 1x1.
 BRUSH_PRESS = 0.1
 BRUSH_PAUSE = 0.2
-# Gap between the two Y presses — Switch UI transitions from the 10-slot
-# sidebar to the full palette grid.
+# Gap between the two Y presses (sidebar → full palette transition).
 Y_GAP = 0.15
-# Palette grid's open animation eats d-pad inputs for a few frames. Without
-# this buffer the first palette move drops and every color lands off-by-one.
+# Palette grid open animation eats d-pad inputs.
 POST_PALETTE_OPEN = 0.3
-# After confirm-A on the palette grid the close animation eats canvas d-pad
-# inputs; wait it out before resuming movement.
+# Palette close animation eats canvas d-pad inputs.
 POST_PALETTE_GAP = 1.0
-# Per-press wall-clock overhead not captured by duration tokens (USB HID poll
-# boundary wait on the Switch's 8ms cycle).
+# Per-press wall-clock overhead not captured by duration tokens, applied
+# in estimate_seconds so the .mz header + countdown match reality.
 PRESS_OVERHEAD = 0.0042
+# Bucket fill costs. In-game bucket animation is functionally instant; only the
+# tool-switch menu has measurable latency. PER_FILL_S is the typical
+# cursor-nav-to-interior + A press. BRUSH_PER_CELL_S is the v2 set-cover
+# average for the break-even check.
+BUCKET_SWITCH_S = 4.4
+PER_FILL_S = 1.0
+BRUSH_PER_CELL_S = 0.0055
 PALETTE_COLS = 12
 PALETTE_ROWS = 7
 ALPHA_THRESHOLD = 128
@@ -80,23 +86,24 @@ INITIAL_PALETTE_IDX = 72  # bottom-left = pure black on a fresh file
 #
 #    col 0   col 1   col 2
 #  row 0: (1x1)   plus    null  <- fresh-file cursor
-#  row 1:  1x1    3x3     5x5
+#  row 1:  1x1    3x3     7x7
 BRUSH_POSITIONS: dict[str, tuple[int, int]] = {
     "null": (2, 0),
     "plus": (1, 0),
     "1x1":  (0, 1),
     "3x3":  (1, 1),
+    "7x7":  (2, 1),
 }
 BRUSH_PATTERNS: dict[str, list[tuple[int, int]]] = {
     "1x1":  [(0, 0)],
     "3x3":  [(dx, dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)],
     "plus": [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)],
+    "7x7":  [(dx, dy) for dy in range(-3, 4) for dx in range(-3, 4)],
+    "null": [],  # Sentinel for the fresh-file state; never emits stamps.
 }
 INITIAL_BRUSH = "1x1"  # post-preamble state; macro_runner selects 1x1 from null
-# Minimum tiles a non-1x1 brush must place to cover its switch cost (enter+exit
-# ≈ 4s; per-tile savings: 3x3=1.6s, +=0.8s). Under-threshold groups get demoted
-# back to 1x1. Module-level so the first-brush peek can mirror the same logic.
-MIN_TILES = {"3x3": 3, "plus": 5}
+# Minimum tiles a non-1x1 brush must place to cover its switch cost.
+MIN_TILES = {"3x3": 3, "plus": 5, "7x7": 1}
 
 
 def load_palette(path: Path) -> np.ndarray:
@@ -164,24 +171,30 @@ _PER_COLOR_CANDIDATES = (
     ("3x3", "1x1"),
     ("plus", "1x1"),
     ("3x3", "plus", "1x1"),
+    ("7x7", "3x3", "1x1"),
+    ("7x7", "3x3", "plus", "1x1"),
     ("1x1",),
 )
 
 
-def _eval_brush_set(start, own, overstampable, brush_set, prior_brush):
+def _eval_brush_set(start, own, overstampable, brush_set, prior_brush,
+                    placement_cache=None):
     """Estimate wall-clock cost of painting `own` with a given brush priority.
-    Returns (cost_seconds, end_cursor, end_brush). Matches the real emit-path
-    tiling (tile_color_pixels + MIN_TILES demotion) and a greedy-NN tour for
-    travel — no 2-opt, to keep per-candidate-per-color evaluation fast."""
-    by_brush = tile_color_pixels(own, overstampable, list(brush_set))
+    Returns (cost_seconds, end_cursor, end_brush). Uses _set_cover_color +
+    MIN_TILES demotion and a greedy-NN tour for travel — no 2-opt, since this
+    runs per-candidate-per-color and has to be fast."""
+    by_brush = _set_cover_color(own, overstampable, list(brush_set),
+                                 placement_cache=placement_cache)
     for b in list(by_brush):
         if b == "1x1":
             continue
         if len(by_brush[b]) < MIN_TILES.get(b, 1):
             del by_brush[b]
-    stamp_s = STAMP_PRESS + STAMP_PAUSE + PRESS_OVERHEAD
     travel_s = PRESS + PAUSE + PRESS_OVERHEAD
-    brush_switch_s = 4.0
+    # STAMP merges the final move-cell with the A-press, so a chebyshev-N hop
+    # costs N*travel_s. Adding a separate per-anchor stamp term double-counts
+    # and biases the picker toward stride-5 brushes over stride-1.
+    brush_switch_s = 4.0  # matches MIN_TILES rationale at module top
     cur = start
     total = 0.0
     cur_brush = prior_brush
@@ -192,6 +205,7 @@ def _eval_brush_set(start, own, overstampable, brush_set, prior_brush):
         if b != cur_brush:
             total += brush_switch_s
             cur_brush = b
+        # Vectorized greedy-NN tour length (matches order_pixels' NN seed).
         pts = np.asarray(anchors, dtype=np.int32)
         n = len(pts)
         visited = np.zeros(n, dtype=bool)
@@ -208,25 +222,32 @@ def _eval_brush_set(start, own, overstampable, brush_set, prior_brush):
             cur_x, cur_y = pts[k, 0], pts[k, 1]
         cur = (int(cur_x), int(cur_y))
         total += travel_cells * travel_s
-        total += n * stamp_s
     return total, cur, cur_brush
 
 
-def _pick_per_color_brushes(pixels_by_color, color_order, later):
+def _pick_per_color_brushes(pixels_by_color, color_order, later,
+                             placement_caches=None):
     """For each color, evaluate every candidate brush set and keep the
-    cheapest. Returns a list parallel to color_order — each entry is the brush
-    priority list to use for that color's tiling. Threads cursor + current
-    brush state through so each pick sees the realistic incoming state."""
+    cheapest. Returns parallel list to color_order — each entry is the brush
+    priority list to use for that color's tiling.
+
+    `placement_caches`, if provided, is populated with one cache per color so
+    the final emit pass can reuse the picker's enumerated placements instead
+    of re-enumerating from scratch."""
     cx, cy = 128, 128
     cur_brush = INITIAL_BRUSH
     picks: list[list[str]] = []
     for idx, color in enumerate(color_order):
         own = pixels_by_color[color]
         overstampable = set(own) | later[idx]
+        cache: dict = {}
+        if placement_caches is not None:
+            placement_caches[color] = cache
         best = None
         for cs in _PER_COLOR_CANDIDATES:
             cost, end_cur, end_brush = _eval_brush_set(
-                (cx, cy), own, overstampable, cs, cur_brush)
+                (cx, cy), own, overstampable, cs, cur_brush,
+                placement_cache=cache)
             if best is None or cost < best[0]:
                 best = (cost, end_cur, end_brush, list(cs))
         picks.append(best[3])
@@ -249,8 +270,7 @@ def _first_used_brush(pixels_by_color, color_order, brushes):
     for c in color_order[1:]:
         later_first.update(pixels_by_color[c])
     overstampable = set(own) | later_first
-    by_brush = tile_color_pixels(own, overstampable, brushes)
-    own_set = set(own)
+    by_brush = _set_cover_color(own, overstampable, brushes)
     for brush in list(by_brush):
         if brush == "1x1":
             continue
@@ -283,7 +303,7 @@ class MacroBuilder:
         cur_bx, cur_by = BRUSH_POSITIONS[self.current_brush]
         bx, by = BRUSH_POSITIONS[name]
         self.press("X", BRUSH_PRESS, BRUSH_PAUSE)
-        # BRUSH_PAUSE already covers the inter-X gap — no extra delay needed.
+        # BRUSH_PAUSE between Xs is enough; no extra inter-X gap.
         self.press("X", BRUSH_PRESS, BRUSH_PAUSE)
         self.lines.append(f"{POST_PALETTE_OPEN}s")
         self.move(bx - cur_bx, by - cur_by, BRUSH_PRESS, BRUSH_PAUSE,
@@ -365,54 +385,112 @@ def palette_xy(idx: int) -> tuple[int, int]:
     return idx % PALETTE_COLS, idx // PALETTE_COLS
 
 
-def tile_color_pixels(
-    own_pixels: list[tuple[int, int]],
-    overstampable: set[tuple[int, int]],
-    brushes_priority: list[str],
-) -> dict[str, list[tuple[int, int]]]:
-    """Greedy-tile one color's pixels with the brushes in priority order.
+def _enumerate_valid_placements(own_set: frozenset, overstampable: frozenset,
+                                 brush: str):
+    """Return (own_list, placements) for one (color, brush) pair.
 
-    A brush tile for this color is valid if every one of its pattern cells is
-    in `overstampable` — which should be (this color's pixels) ∪ (pixels of
-    any colors drawn LATER in the schedule). Overstamping later-color cells is
-    free: those cells get repainted to their final color in a later pass, so
-    the "temporary" stamp costs nothing extra. This lets a dominant background
-    color use 3x3 freely through small-feature interruptions.
-
-    Every placed tile must still paint at least one of `own_pixels` (else it
-    would do zero useful work). Subsequent tiles of this color may overlap
-    cells already painted by a previous same-color tile — re-stamping own-color
-    cells is a visual no-op and lets 3x3s fill 1px gaps between earlier 3x3s.
-
-    Returns {brush_name: [anchor, ...]}. Anchors are cursor positions for A.
+    `placements` is a list of (ax, ay, own_cell_indices) where every footprint
+    cell is in `overstampable` and at least one is own-color. Anchors do NOT
+    need to sit on an own-pixel — any anchor whose footprint touches own is
+    fair game, which lets 7x7/3x3 placements straddle the boundary between own
+    and later-color cells (the densest packings live there).
     """
-    remaining = set(own_pixels)
-    claimable = set(overstampable)
+    pat = BRUSH_PATTERNS[brush]
+    radius = max(max(abs(dx), abs(dy)) for dx, dy in pat)
+
+    own_list = sorted(own_set)
+    own_idx = {p: i for i, p in enumerate(own_list)}
+
+    cand = set()
+    for ox, oy in own_list:
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                cand.add((ox + dx, oy + dy))
+
+    placements = []
+    for ax, ay in cand:
+        cells = [(ax + dx, ay + dy) for dx, dy in pat]
+        if not all(c in overstampable for c in cells):
+            continue
+        own_cells = [own_idx[c] for c in cells if c in own_idx]
+        if not own_cells:
+            continue
+        placements.append((ax, ay, np.asarray(own_cells, dtype=np.int32)))
+    return own_list, placements
+
+
+def _greedy_set_cover_one_brush(own_list, placements, remaining_mask):
+    """Greedy max-coverage set cover. Picks the placement that covers the most
+    still-uncovered own cells, removes those cells, repeats until no placement
+    adds ≥1 new own cell. Mutates `remaining_mask` in place."""
+    if not placements:
+        return []
+    n = len(placements)
+    fp_sz = max(len(own_cells) for (_, _, own_cells) in placements)
+    foot = np.full((n, fp_sz), -1, dtype=np.int32)
+    for i, (_, _, own_cells) in enumerate(placements):
+        foot[i, :len(own_cells)] = own_cells
+    anchors = []
+    active = np.ones(n, dtype=bool)
+    while True:
+        sentinel = len(remaining_mask)
+        idx = np.where(foot < 0, sentinel, foot)
+        ext = np.concatenate([remaining_mask, np.zeros(1, dtype=bool)])
+        gains = ext[idx].sum(axis=1)
+        gains[~active] = 0
+        best = int(gains.argmax())
+        if int(gains[best]) < 1:
+            break
+        ax, ay, own_cells = placements[best]
+        anchors.append((ax, ay))
+        remaining_mask[own_cells] = False
+        active[best] = False
+    return anchors
+
+
+def _set_cover_color(own_pixels, overstampable, brushes_priority,
+                     placement_cache=None):
+    """Tile one color via greedy set-cover, brush by brush in priority order.
+
+    `placement_cache`, if provided, maps brush_name -> (own_list, placements)
+    pre-enumerated by the caller. Lets the per-color picker enumerate each
+    brush once and reuse across 6 candidate brush sets instead of redoing
+    the work per candidate.
+
+    Returns {brush: [anchor, ...]} including a final "1x1" group for any cells
+    not covered by larger brushes.
+    """
+    own_set = frozenset(own_pixels)
+    overstampable_set = frozenset(overstampable)
     out: dict[str, list[tuple[int, int]]] = {}
+
+    own_list = None
+    remaining_mask = None
+
     for brush in brushes_priority:
         if brush == "1x1":
-            continue  # handled at end with whatever's left
-        pattern = BRUSH_PATTERNS[brush]
-        anchors: list[tuple[int, int]] = []
-        # Try every own-pixel as a potential anchor. Row-major for determinism.
-        for ax, ay in sorted(own_pixels, key=lambda p: (p[1], p[0])):
-            cells = [(ax + dx, ay + dy) for dx, dy in pattern]
-            if not all(c in claimable for c in cells):
-                continue
-            # Must paint enough still-needed own cells to beat the 1x1 cleanup
-            # cost. ≥3 new cells per tile is the empirical sweet spot on dense
-            # images — lower thresholds over-place overlapping tiles, higher
-            # ones miss gap-fill opportunities.
-            new_cells = sum(1 for c in cells if c in remaining)
-            if new_cells < 3:
-                continue
-            anchors.append((ax, ay))
-            for c in cells:
-                remaining.discard(c)
+            continue
+        if placement_cache is not None and brush in placement_cache:
+            own_list_b, placements = placement_cache[brush]
+        else:
+            own_list_b, placements = _enumerate_valid_placements(
+                own_set, overstampable_set, brush)
+            if placement_cache is not None:
+                placement_cache[brush] = (own_list_b, placements)
+        if own_list is None:
+            own_list = own_list_b
+            remaining_mask = np.ones(len(own_list), dtype=bool)
+        anchors = _greedy_set_cover_one_brush(own_list, placements,
+                                              remaining_mask)
         if anchors:
             out[brush] = anchors
-    if remaining:
-        out["1x1"] = list(remaining)
+    if own_list is not None:
+        leftover = [own_list[i] for i in range(len(own_list))
+                    if remaining_mask[i]]
+    else:
+        leftover = list(own_pixels)
+    if leftover:
+        out["1x1"] = leftover
     return out
 
 
@@ -422,24 +500,29 @@ def simulate_macro(
 ) -> np.ndarray:
     """Replay the macro against a fresh item-file state and return the RGBA
     image it would leave on the canvas. Modes:
-      canvas         — DPAD moves cx/cy; A/STAMP paints current_brush at (cx,cy)
+      canvas         — DPAD moves cx/cy; A paints with the current tool
+                        (brush stamps current_brush, bucket flood-fills the
+                        connected same-state region).
       palette_side   — Y opens the 10-slot sidebar first
       palette_grid   — second Y opens the full 12×7 grid; DPAD moves px/py,
                        A commits the new color and returns to canvas.
-      brush_side     — X opens the brush sidebar
+      brush_side     — X opens the brush sidebar — DPAD shifts a relative
+                       cursor (LEFT goes to bucket, RIGHT goes to brush),
+                       A commits the tool and returns to canvas.
       brush_grid     — second X opens the full brush grid; DPAD moves bx/by,
                        A commits the brush and returns to canvas.
     """
     canvas = np.zeros((size, size, 4), dtype=np.uint8)
-    # Match the generator: cursor parked at canvas center (128, 128) after the
-    # Pico prelude; first move on the generator side walks it back to (0, 0)
-    # before the first stamp. Out-of-bounds stamps are dropped by stamp_at().
     cx, cy = 128, 128
     px, py = palette_xy(INITIAL_PALETTE_IDX)
     color = INITIAL_PALETTE_IDX
     brush = initial_brush
     bx, by = BRUSH_POSITIONS[brush]
+    tool = "brush"
     mode = "canvas"
+    # Relative sidebar cursor offset from the current tool: -1 = bucket from
+    # brush, +1 = brush from bucket. Reset to 0 when sidebar opens.
+    sidebar_offset = 0
 
     def stamp_at(ax: int, ay: int) -> None:
         for dx, dy in BRUSH_PATTERNS[brush]:
@@ -448,31 +531,76 @@ def simulate_macro(
                 canvas[ny, nx, :3] = palette[color].astype(np.uint8)
                 canvas[ny, nx, 3] = 255
 
+    def bucket_fill(ax: int, ay: int) -> None:
+        if not (0 <= ax < size and 0 <= ay < size):
+            return
+        target_alpha = int(canvas[ay, ax, 3])
+        target_rgb = tuple(int(v) for v in canvas[ay, ax, :3])
+        new_rgb = tuple(int(v) for v in palette[color].astype(np.uint8))
+        if target_alpha == 255 and target_rgb == new_rgb:
+            return
+        visited = np.zeros((size, size), dtype=bool)
+        q = deque([(ax, ay)])
+        visited[ay, ax] = True
+        while q:
+            x, y = q.popleft()
+            canvas[y, x, 0] = new_rgb[0]
+            canvas[y, x, 1] = new_rgb[1]
+            canvas[y, x, 2] = new_rgb[2]
+            canvas[y, x, 3] = 255
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < size and 0 <= ny < size):
+                    continue
+                if visited[ny, nx]:
+                    continue
+                if int(canvas[ny, nx, 3]) != target_alpha:
+                    continue
+                if target_alpha == 255 and tuple(
+                        int(v) for v in canvas[ny, nx, :3]) != target_rgb:
+                    continue
+                visited[ny, nx] = True
+                q.append((nx, ny))
+
     for line in macro_lines:
         toks = line.strip().split()
-        # Token lines end with a duration like "0.067s" — skip bare pauses.
         if len(toks) < 2 or not toks[-1].endswith("s"):
             continue
         btn = toks[0]
         if btn == "Y":
             mode = "palette_side" if mode == "canvas" else "palette_grid"
         elif btn == "X":
-            mode = "brush_side" if mode == "canvas" else "brush_grid"
+            if mode == "canvas":
+                mode = "brush_side"
+                sidebar_offset = 0
+            else:
+                mode = "brush_grid"
         elif btn == "A":
             if mode == "canvas":
-                stamp_at(cx, cy)
+                if tool == "bucket":
+                    bucket_fill(cx, cy)
+                else:
+                    stamp_at(cx, cy)
             elif mode == "palette_grid":
                 color = py * PALETTE_COLS + px
                 mode = "canvas"
             elif mode == "brush_grid":
-                # Match brush whose position equals (bx, by). If multiple
-                # entries share a position (e.g. 5x5 placeholder), any is fine
-                # — generator won't emit for those cases anyway.
                 for name, pos in BRUSH_POSITIONS.items():
                     if pos == (bx, by):
                         brush = name
+                        tool = "brush"
                         break
                 mode = "canvas"
+            elif mode == "brush_side":
+                # Sidebar tool select: LEFT (offset -1) from brush goes to
+                # bucket; RIGHT (offset +1) from bucket goes back to brush.
+                if tool == "brush" and sidebar_offset == -1:
+                    tool = "bucket"
+                elif tool == "bucket" and sidebar_offset == 1:
+                    tool = "brush"
+                mode = "canvas"
+        elif btn == "B":
+            mode = "canvas"
         elif btn.startswith("DPAD_"):
             dirs = btn.split("_", 1)[1]
             dx = (1 if "RIGHT" in dirs else 0) - (1 if "LEFT" in dirs else 0)
@@ -480,26 +608,89 @@ def simulate_macro(
             if mode == "canvas":
                 cx += dx; cy += dy
             elif mode == "palette_grid":
-                # Palette ignores diagonal hat inputs — model it as no-op so
-                # any accidental diagonal in palette nav shows up as a diff.
-                if dx and dy:
-                    pass
-                else:
+                if not (dx and dy):
                     px += dx; py += dy
             elif mode == "brush_grid":
-                # Assume brush grid also cardinal-only (same pattern as palette).
-                if dx and dy:
-                    pass
-                else:
+                if not (dx and dy):
                     bx += dx; by += dy
+            elif mode == "brush_side":
+                sidebar_offset += dx
         elif btn.startswith("STAMP_DPAD_"):
             dirs = btn.split("_", 2)[2]
             dx = (1 if "RIGHT" in dirs else 0) - (1 if "LEFT" in dirs else 0)
             dy = (1 if "DOWN" in dirs else 0) - (1 if "UP" in dirs else 0)
             if mode == "canvas":
                 cx += dx; cy += dy
-                stamp_at(cx, cy)
+                if tool == "bucket":
+                    bucket_fill(cx, cy)
+                else:
+                    stamp_at(cx, cy)
     return canvas
+
+
+def _find_bucket_color(pixels_by_color, mask):
+    """Pick the single color whose deferred-bucket-fill would save the most
+    runtime. Returns (color, components, savings_s) or None.
+
+    A color is eligible iff every one of its connected components (4-conn,
+    computed on own_mask | truly_transparent) contains no truly-transparent
+    cells. Components that touch the transparent padding are skipped — a
+    bucket-fill there would paint the padding and corrupt the output.
+
+    Components are stored as a (k, 2) int32 array of all own cells so the
+    emit pass can enter each component via the cell closest to the current
+    cursor instead of always the top-left."""
+    truly_transparent = ~mask
+    best = None
+    for c, own_cells in pixels_by_color.items():
+        own_mask = np.zeros_like(mask)
+        for x, y in own_cells:
+            own_mask[y, x] = True
+        unpainted = own_mask | truly_transparent
+        labels, n_comp = scipy_label(
+            unpainted,
+            structure=np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]]),
+        )
+        components = []
+        eligible = True
+        for comp_id in range(1, n_comp + 1):
+            comp_mask = (labels == comp_id)
+            if (comp_mask & truly_transparent).any():
+                if (comp_mask & own_mask).any():
+                    eligible = False
+                    break
+                continue
+            ys, xs = np.where(comp_mask)
+            cells = np.stack([xs.astype(np.int32), ys.astype(np.int32)],
+                              axis=1)
+            components.append((cells, int(comp_mask.sum())))
+        if not eligible or not components:
+            continue
+        total_cells = sum(n for _, n in components)
+        bucket_cost = BUCKET_SWITCH_S + len(components) * PER_FILL_S
+        brush_cost = total_cells * BRUSH_PER_CELL_S
+        savings = brush_cost - bucket_cost
+        if savings > 0 and (best is None or savings > best[2]):
+            best = (c, components, savings)
+    return best
+
+
+def _emit_tool_switch(builder, target_tool: str, current_tool: str) -> None:
+    """Switch between brush and bucket via the X sidebar.
+    From brush: X-LEFT-A. From bucket: X-RIGHT-A. Cost ~2.2s per direction."""
+    if target_tool == current_tool:
+        return
+    builder.press("X", BRUSH_PRESS, BRUSH_PAUSE)
+    builder.lines.append(f"{POST_PALETTE_OPEN}s")
+    if target_tool == "bucket" and current_tool == "brush":
+        builder.press("DPAD_LEFT", BRUSH_PRESS, BRUSH_PAUSE)
+    elif target_tool == "brush" and current_tool == "bucket":
+        builder.press("DPAD_RIGHT", BRUSH_PRESS, BRUSH_PAUSE)
+    else:
+        raise ValueError(
+            f"unsupported tool transition: {current_tool} -> {target_tool}")
+    builder.press("A", BRUSH_PRESS, BRUSH_PAUSE)
+    builder.lines.append(f"{POST_PALETTE_GAP}s")
 
 
 # Binary v3 format — emitted uncompressed as `<name>_macro.mz`. Runner
@@ -518,11 +709,8 @@ V3_TOKENS = [
 V3_IDX = {t: i for i, t in enumerate(V3_TOKENS)}
 V3_OP_SINGLE = 0x00
 V3_OP_REPEAT = 0x20
-# Long-press: [0x40 | idx] [ms]. Durations up to 255ms. Brush/palette A-presses
-# need to hold longer than the 34ms STAMP cadence — a dropped brush-menu A
-# leaves the real brush on the previous value, silently degrading 3x3 → 1x1
-# for the rest of that pass. SINGLE/REPEAT don't encode a duration byte; this
-# opcode does.
+# Long-press: [0x40 | idx] [ms]. Encodes durations up to 255ms — used by
+# brush/palette menu presses that need to outlast the 34ms STAMP cadence.
 V3_OP_LONG_PRESS = 0x40
 V3_OP_PAUSE = 0x80
 
@@ -668,7 +856,10 @@ def to_compact(lines: list[str]) -> list[str]:
 
 
 def estimate_seconds(lines: list[str]) -> float:
-    """Sum every duration token plus PRESS_OVERHEAD per press line."""
+    """Sum every duration token plus a per-press overhead term. Duration tokens
+    capture the planned on-wire time; PRESS_OVERHEAD covers USB-poll wait and
+    firmware dispatch that aren't in the macro text. Without it, a 30k-press
+    print undercounts by ~2 min."""
     total = 0.0
     presses = 0
     for line in lines:
@@ -685,14 +876,21 @@ def estimate_seconds(lines: list[str]) -> float:
 
 
 def generate(image_path: Path, target_size: int, suffix: str = "",
-             saturation: float = 1.0,
-             contrast: float = 1.0,
+             saturation: float = 1.0, contrast: float = 1.0,
              sharpness: float = 1.0,
+             a_pause: float | None = None,
+             pre_a_pause: float | None = None,
              brushes: list[str] | None = None,
-             per_color: bool = False,
+             per_color: bool = True,
              use_oklab: bool = False,
+             use_bucket: bool = True,
              write_outputs: bool = True,
              debug: bool = False) -> dict:
+    global A_PAUSE, PRE_A_PAUSE
+    if a_pause is not None:
+        A_PAUSE = a_pause
+    if pre_a_pause is not None:
+        PRE_A_PAUSE = pre_a_pause
     if brushes is None:
         brushes = ["1x1"]
     if "1x1" not in brushes:
@@ -710,10 +908,10 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
     palette = load_palette(palette_path)
 
     # Preserve aspect ratio: fit within target_size × target_size and pad any
-    # remaining space with transparent pixels. Non-square sources (e.g. a book
-    # cover sized to the 180×256 in-game book canvas) are centered rather than
-    # stretched to a square; the transparent padding drops out of the mask so
-    # no stamps are emitted for those cells.
+    # remaining space with transparent pixels. Non-square sources (book covers
+    # at 180×256, DVD/TV at 256×131, games at 256×144) get centered instead of
+    # stretched to square; the transparent padding drops out of the mask so no
+    # stamps are emitted for those cells.
     img = ImageOps.pad(
         Image.open(image_path).convert("RGBA"),
         (target_size, target_size),
@@ -723,7 +921,9 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
     if contrast != 1.0 or saturation != 1.0 or sharpness != 1.0:
         # Adjust on RGB only; preserve alpha so transparent regions stay
         # transparent. Order: contrast → saturation → sharpness, so edge
-        # enhancement runs last on the already-punched-up colors.
+        # enhancement runs last on the already-punched-up colors. Muted
+        # sources snap to vivid palette entries; sharpness fights the
+        # LANCZOS-downscale blur before the palette snap.
         r, g, b, a = img.split()
         rgb = Image.merge("RGB", (r, g, b))
         if contrast != 1.0:
@@ -756,52 +956,87 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
     color_order = sorted(pixels_by_color,
                          key=lambda c: -len(pixels_by_color[c]))
 
+    # Bucket scheduling: pick a single color worth deferring to last and
+    # painting via paint-bucket fills. Done BEFORE `later[]` is built so we
+    # can exclude bucket-color cells from earlier colors' overstamp set —
+    # otherwise earlier 7x7 stamps would paint into bucket-color cells with
+    # the wrong color, breaking the transparent-fill assumption.
+    bucket_pick = _find_bucket_color(pixels_by_color, mask) if use_bucket else None
+    bucket_color = bucket_pick[0] if bucket_pick else None
+    bucket_components = bucket_pick[1] if bucket_pick else None
+    if bucket_color is not None:
+        color_order = [c for c in color_order if c != bucket_color] + [bucket_color]
+
     # Precompute cumulative "later color" pixel sets so overstamp tiling for
     # color_order[i] knows which cells it's allowed to paint over. `later[i]`
-    # = union of pixels for color_order[i+1 .. ]. Computed here (before the
-    # initial-brush peek) so the per-color brush picker can see it.
+    # = union of pixels for color_order[i+1 .. ], EXCLUDING bucket-color cells
+    # (those must remain transparent until the bucket-fill pass).
     later: list[set[tuple[int, int]]] = [set()] * len(color_order)
     acc: set[tuple[int, int]] = set()
     for i in range(len(color_order) - 1, -1, -1):
         later[i] = set(acc)
-        acc.update(pixels_by_color[color_order[i]])
+        if color_order[i] != bucket_color:
+            acc.update(pixels_by_color[color_order[i]])
 
     # When per_color is set, each color gets its own brush priority list
     # picked by dry-running every candidate against that color's pixel set.
-    # The global `brushes` parameter is ignored in this mode.
+    # Skip the bucket color — it doesn't use a brush.
     per_color_brushes: list[list[str]] | None = None
+    placement_caches: dict = {}
     if per_color:
-        per_color_brushes = _pick_per_color_brushes(
-            pixels_by_color, color_order, later)
-        first_brushes = per_color_brushes[0] if per_color_brushes else ["1x1"]
+        non_bucket_pbc = {c: v for c, v in pixels_by_color.items()
+                          if c != bucket_color}
+        non_bucket_order = [c for c in color_order if c != bucket_color]
+        non_bucket_later = [later[color_order.index(c)] for c in non_bucket_order]
+        nb_picks = _pick_per_color_brushes(
+            non_bucket_pbc, non_bucket_order, non_bucket_later,
+            placement_caches=placement_caches)
+        nb_iter = iter(nb_picks)
+        per_color_brushes = [
+            None if c == bucket_color else next(nb_iter)
+            for c in color_order
+        ]
+        first_brushes = (per_color_brushes[0]
+                          if per_color_brushes and per_color_brushes[0]
+                          else ["1x1"])
     else:
         first_brushes = brushes
-    initial_brush = _first_used_brush(pixels_by_color, color_order, first_brushes)
+
+    if color_order and color_order[0] != bucket_color:
+        initial_brush = _first_used_brush(pixels_by_color, color_order, first_brushes)
+    else:
+        initial_brush = INITIAL_BRUSH
 
     builder = MacroBuilder(initial_brush=initial_brush)
-    # Assume the Pico prelude parks the cursor at canvas center (128, 128).
-    # The generator emits a single long diagonal travel to reach the first
-    # pixel — no manual "move to top-left before pressing start" required.
+    # v2 .mz files embed the brush-selection sequence at the head of the
+    # opcode stream so the runner is fully data-driven. Brush cursor parks
+    # on "null" (2, 0) on a fresh item file — emit navigation from there
+    # to the macro's actual initial brush. brush_select bumps the
+    # switch-count stat; reset so the embedded preamble doesn't pollute
+    # the report.
+    builder.current_brush = "null"
+    builder.brush_select(initial_brush)
+    builder.brush_switches = 0
     cx, cy = 128, 128                     # canvas cursor (absolute, not relative)
     px, py = palette_xy(INITIAL_PALETTE_IDX)  # palette cursor
     stamps = 0                            # A-presses on canvas (multi-cell w/ bigger brushes)
     covered: set[tuple[int, int]] = set() # unique canvas cells hit by a stamp footprint
     switches = 0
+    bucket_fills = 0
+    current_tool = "brush"
 
     # Color order was computed above (needed for initial_brush peek).
     # Rationale: largest pixel-count first so big-area colors benefit most
     # from 3x3/+ brushes AND can overstamp lots of smaller colors' detail
     # pixels (later colors repaint those cells for free). Palette-walk cost
-    # is ~3% of total runtime.
+    # is ~3% of total runtime; no whites-last override.
 
     # Canvas travel uses diagonal hat taps, so cost is Chebyshev distance.
     def cheby(a: tuple[int, int], b: tuple[int, int]) -> int:
         return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
     def order_pixels(start: tuple[int, int], pts: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        # Greedy nearest-neighbor seed + 2-opt refinement. Vectorized because
-        # this is the inner loop of the whole generator — every pixel of every
-        # color group passes through here.
+        # Greedy nearest-neighbor seed + 2-opt refinement, vectorized.
         if not pts:
             return []
         pts_arr = np.asarray(pts, dtype=np.int32)
@@ -821,9 +1056,7 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
             cur_x, cur_y = pts_arr[k, 0], pts_arr[k, 1]
         tour_arr = pts_arr[tour_idx].copy()
 
-        # 2-opt is O(n²) per pass and runs until convergence. Above ~500 pixels
-        # color groups are dense fills where greedy-NN is already near-optimal
-        # (every cell has a neighbor at distance 1) — skip the refinement.
+        # 2-opt is O(n²); skip on dense groups where NN is already optimal.
         if n > 500:
             return [tuple(row.tolist()) for row in tour_arr]
 
@@ -835,8 +1068,10 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
             for i in range(m - 1):
                 a = tour_arr[i - 1] if i > 0 else start_arr
                 b = tour_arr[i]
-                c = tour_arr[i + 1:m]
+                # Vectorize the inner j-loop. cheby deltas for all j in [i+1, m).
+                c = tour_arr[i + 1:m]                       # (m-i-1, 2)
                 has_d = np.arange(i + 1, m) < (m - 1)
+                # d[k] = tour_arr[i+1+k+1] when has_d[k] else dummy (not used)
                 d_src = np.minimum(np.arange(i + 2, m + 1), m - 1)
                 d = tour_arr[d_src]
                 ab = max(abs(int(a[0]) - int(b[0])),
@@ -851,7 +1086,7 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
                 after = ac + np.where(has_d, bd, 0)
                 improving = after < before
                 if improving.any():
-                    k = int(improving.argmax())
+                    k = int(improving.argmax())  # first-improvement match
                     j = i + 1 + k
                     tour_arr[i:j + 1] = tour_arr[i:j + 1][::-1]
                     improved = True
@@ -876,11 +1111,46 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         px, py = target_px, target_py
         switches += 1
 
+        if color == bucket_color:
+            # Bucket-fill pass: switch to bucket, fill each component (entering
+            # via its closest cell to the current cursor), switch back.
+            _emit_tool_switch(builder, "bucket", current_tool)
+            current_tool = "bucket"
+            remaining = list(range(len(bucket_components)))
+            while remaining:
+                best_idx = None
+                best_cell = None
+                best_dist = None
+                for ri in remaining:
+                    cells, _ = bucket_components[ri]
+                    d = np.maximum(np.abs(cells[:, 0] - cx),
+                                   np.abs(cells[:, 1] - cy))
+                    k = int(d.argmin())
+                    dist = int(d[k])
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best_idx = ri
+                        best_cell = (int(cells[k, 0]), int(cells[k, 1]))
+                ax, ay = best_cell
+                builder.move(ax - cx, ay - cy)
+                cx, cy = ax, ay
+                builder.press("A", PRESS, PAUSE)
+                bucket_fills += 1
+                remaining.remove(best_idx)
+            for own_pt in pixels_by_color[color]:
+                covered.add(own_pt)
+            _emit_tool_switch(builder, "brush", current_tool)
+            current_tool = "brush"
+            continue
+
         # Overstampable cells = this color's own pixels ∪ later colors' pixels.
         own = pixels_by_color[color]
         overstampable = set(own) | later[idx]
         brushes_here = per_color_brushes[idx] if per_color_brushes else brushes
-        by_brush = tile_color_pixels(own, overstampable, brushes_here)
+        if "1x1" not in brushes_here:
+            brushes_here = list(brushes_here) + ["1x1"]
+        by_brush = _set_cover_color(own, overstampable, brushes_here,
+                                     placement_cache=placement_caches.get(color))
         own_set = set(own)
 
         # Per-color, decide which brushes are worth the switch cost. See
@@ -898,7 +1168,9 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
                             demoted_cells.append(cell)
                 del by_brush[brush]
         if demoted_cells:
-            by_brush.setdefault("1x1", []).extend(demoted_cells)
+            existing = set(by_brush.get("1x1", []))
+            existing.update(demoted_cells)
+            by_brush["1x1"] = list(existing)
 
         # Emit each brush's sub-tour in priority order. Start each sub-tour
         # from current cursor so the 2-opt/NN ordering naturally picks the
@@ -916,25 +1188,18 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
                 for dx, dy in pattern:
                     covered.add((col + dx, row + dy))
 
-    macro_path = out_dir / f"{stem}_macro.mz"
+    macro_path = out_dir / f"{stem}.mz"
     compact_lines = to_compact(builder.lines)
     macro_bytes = to_binary_v3(compact_lines)
-    # 8-byte header: "MZ1" magic + version + estimated_ms (BE uint32).
-    # Version byte doubles as a preamble hint:
-    #   0x01 = land on 1x1 (default)
-    #   0x02 = land on 3x3 (first stamp uses 3x3, skips one brush-menu cycle)
-    #   0x03 = land on plus (first stamp uses plus)
-    version_byte = {"3x3": 0x02, "plus": 0x03}.get(builder.initial_brush, 0x01)
-    estimated_ms_for_hdr = int(round(estimate_seconds(builder.lines) * 1000))
-    header = bytes([0x4D, 0x5A, 0x31, version_byte]) + estimated_ms_for_hdr.to_bytes(4, "big")
-    if write_outputs:
-        macro_path.write_bytes(header + macro_bytes)
 
     # Dry-run simulate the macro against a blank canvas and compare with the
     # quantized preview. Any mismatch means the generator or macro format is
     # wrong — better to catch here than after ten minutes of Switch time.
+    # Start the simulator with brush="null" (2, 0) to match the real
+    # fresh-file state, so the embedded brush preamble navigates from
+    # the same origin the macro itself assumes.
     simulated = simulate_macro(builder.lines, target_size, palette,
-                                initial_brush=builder.initial_brush)
+                                initial_brush="null")
     # Match the simulator's convention: transparent pixels have zeroed RGB so
     # we aren't comparing the quantized fill that sits under alpha=0 regions.
     expected_rgb = np.where(mask[..., None], quantized_rgb, 0).astype(np.uint8)
@@ -943,28 +1208,54 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         Image.fromarray(simulated, "RGBA").save(
             out_dir / f"{stem}_simulated.png"
         )
+
+    # 72×72 BMP thumbnail for the on-device macro grid. Crop to the
+    # non-transparent bbox so small images fill the tile, composite over
+    # black (BMP has no alpha), pad to square with NEAREST so the pixel
+    # grid survives downscaling. Generated unconditionally because v2 .mz
+    # files embed it in the header.
+    THUMB_SIZE = 72
+    sim = Image.fromarray(simulated, "RGBA")
+    bbox = sim.getbbox()
+    if bbox:
+        sim = sim.crop(bbox)
+    bg = Image.new("RGB", sim.size, (0, 0, 0))
+    bg.paste(sim, mask=sim.split()[3])
+    w, h = bg.size
+    scale = min(THUMB_SIZE / w, THUMB_SIZE / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    thumb = Image.new("RGB", (THUMB_SIZE, THUMB_SIZE), (0, 0, 0))
+    thumb.paste(
+        bg.resize((new_w, new_h), Image.NEAREST),
+        ((THUMB_SIZE - new_w) // 2, (THUMB_SIZE - new_h) // 2),
+    )
+    import io
+    bmp_buf = io.BytesIO()
+    thumb.save(bmp_buf, format="BMP")
+    bmp_bytes = bmp_buf.getvalue()
+
+    # v3 .mz layout — BMP at offset 0 so CP's displayio.OnDiskBitmap works
+    # directly (it reads the BMP header from position 0 and uses absolute
+    # f_lseek for pixel data; can't be coaxed into an offset). Macro
+    # trailer comes after the BMP:
+    #   offset 0          BMP file (bmp_size bytes, ends at BMP's bfSize)
+    #   offset bmp_size   "MZ3" magic (3 bytes)
+    #   offset bmp_size+3 version byte (low nibble = preamble brush,
+    #                                   high bit  = paint-bucket scheduling)
+    #   offset bmp_size+4 estimated_ms  BE uint32
+    #   offset bmp_size+8 macro_size    BE uint32 (length of opcode stream)
+    #   offset bmp_size+12 ...          opcode stream
+    # Runners detect format from first 2 bytes ("BM" = v3, "MZ" = v1/v2).
+    version_byte = {"3x3": 0x02, "plus": 0x03, "7x7": 0x04}.get(builder.initial_brush, 0x01)
+    if bucket_color is not None:
+        version_byte |= 0x80
+    estimated_ms_for_hdr = int(round(estimate_seconds(builder.lines) * 1000))
+    mz3_trailer = (bytes([0x4D, 0x5A, 0x33, version_byte])
+                   + estimated_ms_for_hdr.to_bytes(4, "big")
+                   + len(macro_bytes).to_bytes(4, "big"))
     if write_outputs:
-        # 72×72 BMP thumbnail for the on-device macro grid. Crop to the
-        # non-transparent bbox so small images fill the tile, composite over
-        # black (BMP has no alpha), pad to square with NEAREST so the pixel
-        # grid survives downscaling.
-        THUMB_SIZE = 72
-        sim = Image.fromarray(simulated, "RGBA")
-        bbox = sim.getbbox()
-        if bbox:
-            sim = sim.crop(bbox)
-        bg = Image.new("RGB", sim.size, (0, 0, 0))
-        bg.paste(sim, mask=sim.split()[3])
-        w, h = bg.size
-        scale = min(THUMB_SIZE / w, THUMB_SIZE / h)
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-        thumb = Image.new("RGB", (THUMB_SIZE, THUMB_SIZE), (0, 0, 0))
-        thumb.paste(
-            bg.resize((new_w, new_h), Image.NEAREST),
-            ((THUMB_SIZE - new_w) // 2, (THUMB_SIZE - new_h) // 2),
-        )
-        thumb.save(out_dir / f"{stem}_macro.bmp")
+        macro_path.write_bytes(bmp_bytes + mz3_trailer + macro_bytes)
     if not np.array_equal(simulated, expected):
         diff = np.any(simulated != expected, axis=2)
         bad = int(diff.sum())
@@ -973,9 +1264,8 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         )
 
     if per_color_brushes:
-        # Report per-color choices by frequency: "3x3,1x1:15 plus,1x1:6 1x1:32"
         from collections import Counter
-        counts = Counter(",".join(cs) for cs in per_color_brushes)
+        counts = Counter(",".join(cs) for cs in per_color_brushes if cs)
         reported_brushes = ["per-color"] + [f"{k}:{v}" for k, v in counts.most_common()]
     else:
         reported_brushes = brushes
@@ -986,6 +1276,8 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         "canvas_cells": target_size * target_size,
         "color_switches": switches,
         "brush_switches": builder.brush_switches,
+        "bucket_color": bucket_color,
+        "bucket_fills": bucket_fills,
         "brushes": reported_brushes,
         "quantizer": "oklab" if use_oklab else "rgb",
         "stamps": stamps,
@@ -997,94 +1289,107 @@ def generate(image_path: Path, target_size: int, suffix: str = "",
         "initial_brush": builder.initial_brush,
     }
     if write_outputs and debug:
-        (out_dir / f"{stem}_macro_info.json").write_text(
+        (out_dir / f"{stem}.json").write_text(
             json.dumps(info, indent=2)
         )
     info["macro_path"] = str(macro_path)
     return info
 
 
-CANVAS_SIZE = 256
-
-
 def main() -> None:
+    global PRESS, PAUSE, PALETTE_PRESS, PALETTE_PAUSE
     p = argparse.ArgumentParser()
     p.add_argument("image", type=Path)
+    p.add_argument("--size", type=int, default=256)
+    p.add_argument("--press", type=float, help="override canvas press duration (s)")
+    p.add_argument("--pause", type=float, help="override canvas pause duration (s)")
     p.add_argument("--suffix", type=str, default="",
-                   help="appended to output basename, e.g. '_vivid'")
-    p.add_argument("--saturation", type=float, default=1.0,
-                   help="saturation multiplier applied to source before quantization")
-    p.add_argument("--contrast", type=float, default=1.0,
-                   help="contrast multiplier applied to source before quantization")
-    p.add_argument("--sharpness", type=float, default=1.0,
-                   help="sharpness multiplier applied to source before quantization")
-    p.add_argument("--brushes", type=str, default="auto",
+                   help="appended to output basename, e.g. '_slow'")
+    p.add_argument("--saturation", type=float, default=1.0)
+    p.add_argument("--contrast", type=float, default=1.0)
+    p.add_argument("--sharpness", type=float, default=1.0)
+    p.add_argument("--a-pause", type=float, default=None)
+    p.add_argument("--pre-a-pause", type=float, default=None)
+    p.add_argument("--brushes", type=str, default="7x7,3x3,plus,1x1",
                    help="comma-separated brush priority list, largest-first "
-                        "(available: 3x3, plus, 1x1). 'auto' dry-runs every "
-                        "combination and picks the fastest.")
-    p.add_argument("--quant", choices=["rgb", "oklab"], default="rgb",
-                   help="color-distance metric for palette snap. 'oklab' is "
-                        "more vivid but slower at runtime.")
+                        "(available: 7x7, 3x3, plus, 1x1). Per-color picks "
+                        "the cheapest subset per color group automatically.")
+    p.add_argument("--no-bucket", action="store_true",
+                   help="disable paint-bucket scheduling")
+    p.add_argument("--quant", choices=["rgb", "oklab", "auto"], default="auto",
+                   help="palette-snap metric. 'auto' tries both and picks "
+                        "oklab if its runtime overhead is within EITHER the "
+                        "percent or absolute-minute threshold.")
+    p.add_argument("--oklab-threshold-pct", type=float, default=10.0,
+                   help="max percent runtime overhead for oklab in auto mode.")
+    p.add_argument("--oklab-threshold-min", type=float, default=3.0,
+                   help="max absolute-minute runtime overhead for oklab in "
+                        "auto mode.")
     p.add_argument("--debug", action="store_true",
-                   help="also write _simulated.png and _macro_info.json "
-                        "alongside the macro + thumbnail.")
+                   help="also write _simulated.png and a stats JSON.")
     args = p.parse_args()
 
     print(f"Converting {args.image}...", flush=True)
 
-    use_oklab = args.quant == "oklab"
+    if args.press is not None:
+        PRESS = args.press
+    if args.pause is not None:
+        PAUSE = args.pause
 
-    if args.brushes == "auto":
-        # Dry-run every brush combo and pick the fastest by end-to-end estimate.
-        # per-color picks the cheapest brush set INDEPENDENTLY for each color
-        # group; wins on images with mixed-topology colors (sparse dots + dense
-        # fills). Keeping the single-set candidates in the pool bounds the
-        # worst-case so per-color can't regress below the best global choice.
+    brushes = [b.strip() for b in args.brushes.split(",") if b.strip()]
+    unknown = [b for b in brushes if b not in BRUSH_PATTERNS]
+    if unknown:
+        raise SystemExit(f"unknown brush name(s): {unknown}; "
+                         f"available: {list(BRUSH_PATTERNS)}")
+    common = dict(
+        target_size=args.size, suffix=args.suffix,
+        saturation=args.saturation, contrast=args.contrast,
+        sharpness=args.sharpness, a_pause=args.a_pause,
+        pre_a_pause=args.pre_a_pause, brushes=brushes,
+        per_color=True, use_bucket=not args.no_bucket, debug=args.debug,
+    )
+
+    if args.quant == "auto":
+        # Dry-run both quants in parallel (no writes), pick oklab when its
+        # runtime overhead clears the percent OR the absolute-minute floor.
+        # OR-logic protects short prints from being denied oklab over a
+        # large proportional cost that's tiny in absolute terms.
         from concurrent.futures import ProcessPoolExecutor
-        candidates = [
-            ("1x1",          ["1x1"],                False),
-            ("3x3,1x1",      ["3x3", "1x1"],         False),
-            ("plus,1x1",     ["plus", "1x1"],        False),
-            ("3x3,plus,1x1", ["3x3", "plus", "1x1"], False),
-            ("per-color",    ["3x3", "plus", "1x1"], True),
-        ]
-        with ProcessPoolExecutor(max_workers=len(candidates)) as pool:
-            futures = [
-                pool.submit(generate, args.image, CANVAS_SIZE,
-                            suffix=args.suffix, saturation=args.saturation,
-                            contrast=args.contrast, sharpness=args.sharpness,
-                            brushes=cfg, per_color=pc, use_oklab=use_oklab,
-                            write_outputs=False)
-                for _, cfg, pc in candidates
-            ]
-            results = [(f.result()["estimated_seconds"], label, cfg, pc)
-                       for f, (label, cfg, pc) in zip(futures, candidates)]
-        results.sort()
-        print("Auto-brush evaluation:")
-        winner_label = results[0][1]
-        for secs, label, cfg, pc in results:
-            mark = "* " if label == winner_label else "  "
-            print(f"  {mark}{label:20s}  {secs:.0f}s ({secs/60:.1f} min)")
-        _, _, brushes, per_color_flag = results[0]
+        with ProcessPoolExecutor(max_workers=2) as pool:
+            f_rgb = pool.submit(generate, args.image,
+                                 use_oklab=False, write_outputs=False, **common)
+            f_oklab = pool.submit(generate, args.image,
+                                   use_oklab=True, write_outputs=False, **common)
+            rgb_secs = f_rgb.result()["estimated_seconds"]
+            oklab_secs = f_oklab.result()["estimated_seconds"]
+        delta_s = oklab_secs - rgb_secs
+        pct = (delta_s / rgb_secs * 100.0) if rgb_secs > 0 else float("inf")
+        within_pct = pct <= args.oklab_threshold_pct
+        within_abs = delta_s <= args.oklab_threshold_min * 60.0
+        use_oklab = within_pct or within_abs
+        chosen = "oklab" if use_oklab else "rgb"
+        print(f"Quant evaluation:")
+        print(f"  rgb     {rgb_secs:7.0f}s ({rgb_secs/60:5.1f} min)")
+        print(f"  oklab   {oklab_secs:7.0f}s ({oklab_secs/60:5.1f} min)  "
+              f"{pct:+5.1f}% / {delta_s/60:+.1f} min vs rgb")
+        print(f"  -> chose {chosen} (thresholds: "
+              f"{args.oklab_threshold_pct:.0f}% or "
+              f"{args.oklab_threshold_min:.0f} min)")
+        info = generate(args.image, use_oklab=use_oklab,
+                        write_outputs=True, **common)
     else:
-        per_color_flag = False
-        brushes = [b.strip() for b in args.brushes.split(",") if b.strip()]
-        unknown = [b for b in brushes if b not in BRUSH_PATTERNS]
-        if unknown:
-            raise SystemExit(f"unknown brush name(s): {unknown}; "
-                             f"available: {list(BRUSH_PATTERNS)}")
+        info = generate(args.image, use_oklab=(args.quant == "oklab"),
+                        write_outputs=True, **common)
 
-    info = generate(args.image, CANVAS_SIZE, suffix=args.suffix,
-                    saturation=args.saturation, contrast=args.contrast,
-                    sharpness=args.sharpness, brushes=brushes,
-                    per_color=per_color_flag,
-                    use_oklab=use_oklab, debug=args.debug)
     print(f"Source:           {info['source']} -> {info['size']}x{info['size']}")
     print(f"Coverage:         {info['cells_covered']}/{info['canvas_cells']} "
           f"({100*info['cells_covered']/info['canvas_cells']:.1f}%)")
     print(f"Stamps:           {info['stamps']}")
     print(f"Color switches:   {info['color_switches']}")
     print(f"Brush switches:   {info['brush_switches']}  ({','.join(info['brushes'])})")
+    if info["bucket_color"] is not None:
+        print(f"Bucket fills:     {info['bucket_fills']}  "
+              f"(color idx {info['bucket_color']})")
     print(f"Button presses:   {info['button_presses']}")
     secs = info["estimated_seconds"]
     print(f"Estimated runtime: {secs:.0f}s ({secs/60:.1f} min)")

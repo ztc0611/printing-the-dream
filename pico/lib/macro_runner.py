@@ -1,24 +1,14 @@
-"""Parse + execute a macro.txt file by emitting HORIPAD S HID reports.
+"""Parse + execute a macro by emitting HORIPAD S HID reports.
 
-Absolute-deadline executor: every event fires at a deadline computed from the
-run's start time, not relative to the previous event. A late event dispatch
-doesn't shift later events — they keep their own absolute deadlines, so
-jitter doesn't compound across a long macro.
+Absolute-deadline executor: every event fires at a deadline computed
+from the run's start time, not relative to the previous event — late
+dispatches don't shift later events, so jitter doesn't compound.
 
-The progress callback can raise to abort (e.g. ui.MacroAbort on B-press).
-The finally block guarantees NEUTRAL is sent so inputs don't stay latched.
+The progress callback can raise to abort. The finally block guarantees
+NEUTRAL is sent so inputs don't stay latched.
 
-Timing precision notes:
-  * GC is disabled across the main loop and collected explicitly between lines
-    so a multi-ms GC stall can't fire mid-HOLD.
-  * time.sleep() on CircuitPython quantizes to whole ms and rounds DOWN.
-    _wait_until sleeps the bulk then busy-waits the final ~2ms against an
-    absolute deadline; RP2350's timer is 1μs-resolution.
-  * When TIMING_STREAM is True each HOLD prints a CSV row to serial
-    (idx,req_us,actual_us,delta_us,press_skew_us). Capture via the CDC
-    console — no filesystem or buffer allocation involved. The host USB
-    stack polls HID at the same 8ms cadence whether or not anything is
-    plugged into the Switch, so measurements are valid over USB alone.
+GC is disabled across the main loop and collected explicitly between
+events so a multi-ms GC stall can't fire mid-press.
 """
 import gc
 import os
@@ -26,18 +16,15 @@ import time
 
 from horipad_hid import BTN, HAT, HAT_NEUTRAL, STICK_DIR, stick_bytes, report, NEUTRAL
 
-
 NS_PER_S = 1_000_000_000
 NS_PER_US = 1_000
 NS_PER_MS = 1_000_000
 
 
-# V2 compact macro format — emitted by convert.py's to_compact(). Each press
-# is a single short token; a bare integer is a pause in milliseconds; `TOK*N`
-# repeats the press N times. Default press = 34ms, default post-press gap =
-# 33ms. Distinct from v1 (verbose `TOK 0.034s\n0.033s\n`): v2 lines never
-# end with 's', so detection is per-line. Handcrafted macros (timing tests,
-# accel tests) still use v1 and round-trip through the same runner.
+# V2 compact text format: bare token = single press, `TOK*N` = repeat,
+# bare integer = pause in ms. Lines never end with "s" — that's how we
+# distinguish from the v1 verbose format that still flows through the
+# same runner for handcrafted test macros.
 V2_DPAD_HAT = {
     "R": "DPAD_RIGHT", "L": "DPAD_LEFT",
     "U": "DPAD_UP", "D": "DPAD_DOWN",
@@ -46,18 +33,19 @@ V2_DPAD_HAT = {
 }
 V2_STAMP_HAT = {k.lower(): v for k, v in V2_DPAD_HAT.items()}
 V2_BTN = ("A", "B", "X", "Y")
+# Exact 2-frame cycle at 30fps so we don't slip relative to the game
+# frame clock and accidentally trip d-pad acceleration.
+V2_CYCLE_NS = 2 * 33_333_333
 V2_PRESS_NS = 34 * NS_PER_MS
-V2_GAP_NS = 33 * NS_PER_MS
-V2_CYCLE_NS = V2_PRESS_NS + V2_GAP_NS  # per-press advance
+V2_GAP_NS = V2_CYCLE_NS - V2_PRESS_NS
 
 
-# V3 binary format — .mz files (uncompressed byte stream from convert.py
-# to_binary_v3). Opcodes (class = byte & 0xE0):
-#   0x00-0x13 single press (34ms), idx = byte & 0x1F
-#   0x20-0x33 repeat press (34ms), idx = byte & 0x1F, next byte = count (1-255)
-#   0x40-0x53 long-press,           idx = byte & 0x1F, next byte = duration ms
-#   0x80      pause,                next 2 bytes BE = pause ms (0-65535)
-# Token table matches V3_TOKENS in convert.py — do not reorder.
+# V3 binary opcode format. Class = byte & 0xE0:
+#   0x00 single press (34ms)        idx in low 5 bits
+#   0x20 repeat press (34ms)        + 1 byte count
+#   0x40 long-press                 + 1 byte duration_ms
+#   0x80 pause                      + 2 bytes BE duration_ms
+# Token table must match V3_TOKENS in convert.py — do not reorder.
 V3_TOKENS = (
     "DPAD_RIGHT", "DPAD_LEFT", "DPAD_UP", "DPAD_DOWN",
     "DPAD_UP_RIGHT", "DPAD_UP_LEFT", "DPAD_DOWN_RIGHT", "DPAD_DOWN_LEFT",
@@ -78,13 +66,9 @@ V3_OP_LONG_PRESS = 0x40
 V3_OP_PAUSE = 0x80
 
 
-# Brush-select preamble: every macro assumes the drawing brush is 1x1. On a
-# fresh item file the brush cursor parks on the top-right "null" (big circle,
-# unusable). Navigate null (2, 0) → 1x1 (0, 1) before executing the macro body
-# so handcrafted timing macros and convert.py output can both rely on it.
-# Convention: user must open the item file fresh (or not touch the brush menu)
-# before pressing Start. Mirrors the 300ms POST_PALETTE_OPEN and 1s
-# POST_PALETTE_GAP buffers that palette nav in convert.py uses.
+# Brush preamble for text macros. .mz files embed their own preamble
+# (the runner is data-driven for .mz), so this is only run for .txt.
+# Requires the brush cursor to start on "null" (fresh item file).
 BRUSH_PREAMBLE_1X1 = (
     "X 0.1s",
     "0.2s",        # BRUSH_PAUSE between Xs (matches convert.py brush_select)
@@ -105,48 +89,8 @@ BRUSH_PREAMBLE_1X1 = (
     "1.0s",        # POST_PALETTE_GAP — menu close animation
 )
 
-# Alternate preamble that lands on 3x3 instead of 1x1 — saves one brush-menu
-# cycle (~2.5s) on macros whose first stamp uses 3x3. Selected via header
-# version byte 0x02.
-BRUSH_PREAMBLE_3X3 = (
-    "X 0.1s",
-    "0.2s",
-    "X 0.1s",
-    "0.2s",
-    "0.3s",
-    "DPAD_LEFT 0.1s",  # null (2,0) → (1,0)
-    "0.2s",
-    "DPAD_DOWN 0.1s",  # (1,0) → 3x3 (1,1)
-    "0.2s",
-    "A 0.1s",
-    "0.2s",
-    "0.3s",
-    "B 0.1s",
-    "0.2s",
-    "1.0s",
-)
-# Plus-brush variant: null (2,0) → plus (1,0) is one LEFT. Selected via
-# header version byte 0x03.
-BRUSH_PREAMBLE_PLUS = (
-    "X 0.1s",
-    "0.2s",
-    "X 0.1s",
-    "0.2s",
-    "0.3s",
-    "DPAD_LEFT 0.1s",  # null (2,0) → plus (1,0)
-    "0.2s",
-    "A 0.1s",
-    "0.2s",
-    "0.3s",
-    "B 0.1s",
-    "0.2s",
-    "1.0s",
-)
-BRUSH_PREAMBLE = BRUSH_PREAMBLE_1X1  # back-compat alias
 
-
-# Stream a CSV row per HOLD to serial. Zero buffering, zero allocation —
-# accumulating samples in an array exhausts heap under gc.disable().
+# Debug: stream a CSV row per HOLD to the CDC console for timing capture.
 TIMING_STREAM = False
 
 # Sample index, reset per run. Module-level so the HOLD branch can bump it
@@ -154,31 +98,17 @@ TIMING_STREAM = False
 _t_idx = 0
 
 
-# Cancel callback set per run by run_macro. Module-level so every
-# _wait_until call picks it up without threading a param through all the
-# _exec_line_at branches. Called every ~20ms during the sleep phase so
-# B-abort lands inside a long HOLD; must be cheap (no display refresh).
+# Cancel callback set per run by run_macro. Called during the sleep
+# phase so B-abort can land mid-HOLD; must be cheap (no display work).
 _cancel_cb = None
 
 
 def _wait_until(deadline_ns):
     """Sleep then busy-wait until monotonic_ns() >= deadline_ns.
 
-    Plain busy-wait allocates a bigint on every monotonic_ns() call; over
-    a 1-second wait that's tens of thousands of allocations which exhaust
-    heap under gc.disable(). Hybrid approach: time.sleep() covers the bulk
-    (sub-ms rounding doesn't matter when we're still >3ms from deadline),
-    busy-wait only the final ~2ms where precision matters.
-
-    `cancel_cb` (if given) is invoked every ~20ms during the sleep phase
-    so B-abort can land inside a long HOLD instead of waiting for the
-    next macro line. It must be cheap — no display work — or it'll steal
-    time from the busy-wait and stretch the release edge past the next
-    USB poll. The callback raises (MacroAbort) to abort.
-
-    If we're already past the deadline (stalled), returns immediately —
-    the event fires late, but subsequent events keep their own absolute
-    deadlines so drift doesn't compound.
+    Hybrid approach: time.sleep() for the bulk, busy-wait the final
+    ~2ms. Plain busy-wait allocates a bigint per call and exhausts the
+    heap under gc.disable().
     """
     while True:
         remaining = deadline_ns - time.monotonic_ns()
@@ -199,18 +129,29 @@ def _write(dev, data):
     dev.send(data)
 
 
-def _gc_sync(t_cursor):
-    """Run GC and rebase t_cursor to wall clock if GC outran the planned gap.
+_FRAME_NS = 33_333_333  # ~30fps frame at the Tomodachi lobby framerate
 
-    Without rebasing, a GC stall past `t_cursor` leaves the next `_wait_until`
-    firing immediately — the NEXT press then gets a shortened hold (because
-    its release deadline was computed from the old t_cursor). Rebasing keeps
-    press duration at the designed 34/67/100ms even when GC steals time; the
-    only cost is cadence slip, which is invisible to the Switch.
+
+def _gc_sync(t_cursor):
+    """Run GC and rebase t_cursor if GC overran.
+
+    On overrun, advance t_cursor to the next frame-aligned boundary past the
+    overrun rather than to "now". Keeps the post-GC press's phase consistent
+    with where it would have landed without GC — avoids resuming at an
+    arbitrary phase within a frame where the Switch's input poll could
+    sample the press mid-transition.
     """
     gc.collect()
     now = time.monotonic_ns()
-    return now if now > t_cursor else t_cursor
+    if now <= t_cursor:
+        return t_cursor
+    overrun = now - t_cursor
+    frames = (overrun + _FRAME_NS - 1) // _FRAME_NS  # ceiling
+    # Guarantee at least 2 frames of headroom on a rebase so the next press's
+    # release deadline (t_cursor + V2_PRESS_NS = 34ms) is always in the
+    # future relative to the rebased t_cursor — defends against any edge
+    # case where the rebase undershoots by less than a full press window.
+    return t_cursor + max(frames, 2) * _FRAME_NS
 
 
 def _count_lines(path):
@@ -413,8 +354,13 @@ def _exec_line_at(dev, line, t_cursor):
 V3_READ_BUF = bytearray(512)  # module-level: allocate once, never resize.
 
 
-def _run_v3(dev, f, total_bytes, progress_cb, t_cursor):
-    """Stream-parse an uncompressed v3 binary file and execute opcodes.
+def _run_v3(dev, f, total_bytes, progress_cb, t_cursor, macro_limit=None):
+    """Stream-parse an uncompressed v3 opcode stream and execute it.
+
+    The caller is responsible for seeking `f` to the start of the opcode
+    bytes — this loop reads forward from the current position and stops
+    at `macro_limit` bytes (so MZ2's trailing BMP / MZ3's preceding BMP
+    don't get parsed as opcodes).
 
     Reads into a pre-allocated bytearray (`V3_READ_BUF`) via `readinto()` —
     zero per-byte allocations. Tracks (pos, end) into the buffer and refills
@@ -427,19 +373,12 @@ def _run_v3(dev, f, total_bytes, progress_cb, t_cursor):
     (many KB per press). A REPEAT op can pack 100+ presses, so per-opcode GC
     isn't enough; we need per-press. The GC window fits inside the 33ms
     post-release gap so press cadence is unaffected.
-
-    progress_cb fires every 64 opcodes and is followed by its own
-    gc.collect() because display.refresh() allocates framebuffer data.
     """
     buf = V3_READ_BUF
     pos = 0
     end = f.readinto(buf)
-    # Optional 8-byte header (magic "MZ1" + version + estimated_ms BE). If
-    # present, skip it; headerless .mz files still execute. Version byte
-    # 0x01 = land on 1x1 in preamble, 0x02 = land on 3x3 (run_macro handles
-    # preamble selection before we get here — we just skip the bytes).
-    if end >= 8 and buf[0] == 0x4D and buf[1] == 0x5A and buf[2] == 0x31:
-        pos = 8
+    if macro_limit is not None and end > macro_limit:
+        end = macro_limit
     a_val = BTN["A"]
     byte_pos = 0
     while True:
@@ -448,6 +387,12 @@ def _run_v3(dev, f, total_bytes, progress_cb, t_cursor):
             pos = 0
             if end == 0:
                 break
+            if macro_limit is not None:
+                remaining = macro_limit - byte_pos
+                if remaining <= 0:
+                    break
+                if end > remaining:
+                    end = remaining
         b = buf[pos]; pos += 1; byte_pos += 1
         cls = b & 0xE0
         if cls == V3_OP_SINGLE:
@@ -593,35 +538,66 @@ def run_macro(dev, macro_path, progress_cb=None, cancel_cb=None):
     gc.collect()
     is_binary = macro_path.endswith(".mz")
     total = 0 if is_binary else _count_lines(macro_path)
-    # Pick preamble based on .mz header version byte. 0x02 = convert.py
-    # determined the first stamp uses 3x3, so landing on 3x3 directly skips
-    # one brush-menu cycle. Any other value (including headerless .mz and
-    # all .txt macros) uses the default 1x1 preamble.
-    preamble = BRUSH_PREAMBLE_1X1
+    macro_limit = None
+    opcode_start = 0  # byte offset of first opcode byte inside the .mz
     if is_binary:
         with open(macro_path, "rb") as _hf:
-            _hdr = _hf.read(8)
-        if (len(_hdr) < 8 or _hdr[0] != 0x4D or _hdr[1] != 0x5A
-                or _hdr[2] != 0x31):
-            raise RuntimeError("bad .mz header (expected MZ1 magic)")
-        if _hdr[3] not in (0x01, 0x02, 0x03):
-            raise RuntimeError("unsupported .mz version: 0x%02x" % _hdr[3])
-        if _hdr[3] == 0x02:
-            preamble = BRUSH_PREAMBLE_3X3
-        elif _hdr[3] == 0x03:
-            preamble = BRUSH_PREAMBLE_PLUS
+            _sniff = _hf.read(6)
+        if len(_sniff) < 2:
+            raise RuntimeError("empty .mz file")
+        if _sniff[0] == 0x42 and _sniff[1] == 0x4D:
+            # MZ3 layout: BMP first (offsets 0..bfSize), then "MZ3"+header
+            # + opcode stream. bfSize at bytes 2..5 of the BMP header.
+            bmp_size = _sniff[2] | (_sniff[3] << 8) | (_sniff[4] << 16) | (_sniff[5] << 24)
+            with open(macro_path, "rb") as _hf:
+                _hf.seek(bmp_size)
+                _trailer = _hf.read(12)
+            if (len(_trailer) < 12 or _trailer[0] != 0x4D or _trailer[1] != 0x5A
+                    or _trailer[2] != 0x33):
+                raise RuntimeError("bad MZ3 trailer (expected MZ3 magic)")
+            brush_byte = _trailer[3] & 0x0F
+            if brush_byte not in (0x01, 0x02, 0x03, 0x04):
+                raise RuntimeError("unsupported MZ3 version: 0x%02x" % _trailer[3])
+            macro_limit = ((_trailer[8] << 24) | (_trailer[9] << 16)
+                           | (_trailer[10] << 8) | _trailer[11])
+            opcode_start = bmp_size + 12
+        elif _sniff[0] == 0x4D and _sniff[1] == 0x5A:
+            # MZ1/MZ2 (legacy): header first, opcodes after. MZ2 has a BMP
+            # appended past the opcode stream.
+            with open(macro_path, "rb") as _hf:
+                _hdr = _hf.read(16)
+            if _hdr[2] not in (0x31, 0x32):
+                raise RuntimeError("unsupported .mz magic: %s" % _hdr[:3])
+            brush_byte = _hdr[3] & 0x0F
+            if brush_byte not in (0x01, 0x02, 0x03, 0x04):
+                raise RuntimeError("unsupported .mz version: 0x%02x" % _hdr[3])
+            if _hdr[2] == 0x32 and len(_hdr) >= 16:
+                macro_limit = ((_hdr[8] << 24) | (_hdr[9] << 16)
+                               | (_hdr[10] << 8) | _hdr[11])
+                opcode_start = 16
+            elif _hdr[2] == 0x31:
+                opcode_start = 8
+        else:
+            raise RuntimeError("unrecognized .mz magic: %s" % _sniff[:2])
     start = time.monotonic()
     if TIMING_STREAM:
         print("T_HEADER,idx,req_us,actual_us,delta_us,press_skew_us")
     try:
         t_cursor = time.monotonic_ns()
         gc.disable()
-        for line in preamble:
-            t_cursor = _exec_line_at(dev, line, t_cursor)
+        # .mz files embed their own brush preamble at the head of the opcode
+        # stream (convert.py emits it). .txt macros don't — fall back to the
+        # runner-side prelude so handcrafted timing tests still land on 1x1.
+        if not is_binary:
+            for line in BRUSH_PREAMBLE_1X1:
+                t_cursor = _exec_line_at(dev, line, t_cursor)
         if is_binary:
-            total_bytes = os.stat(macro_path)[6]
+            file_bytes = os.stat(macro_path)[6]
+            total_bytes = macro_limit if macro_limit is not None else file_bytes
             with open(macro_path, "rb") as f:
-                t_cursor = _run_v3(dev, f, total_bytes, progress_cb, t_cursor)
+                f.seek(opcode_start)
+                t_cursor = _run_v3(dev, f, total_bytes, progress_cb, t_cursor,
+                                    macro_limit=macro_limit)
         else:
             with open(macro_path, "r") as f:
                 for i, raw in enumerate(f):

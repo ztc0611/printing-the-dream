@@ -1,9 +1,8 @@
 """boot.py — runs before code.py on every CircuitPython boot.
 
-Replaces CircuitPython's default keyboard-HID with a custom HORIPAD-S gamepad
-descriptor, overrides the USB identity to match HORI's real VID/PID, and
-disables USB mass storage so code.py can write to flash at runtime. Requires
-CircuitPython 8.2+ for supervisor.set_usb_identification.
+Registers the HORIPAD-S HID identity, overrides VID/PID, decides whether
+to expose the USB mass-storage drive, and enables the CDC console.
+Requires CircuitPython 8.2+.
 """
 import microcontroller
 import storage
@@ -14,9 +13,7 @@ import usb_hid
 import config
 
 
-# UI writes 0xA5 to nvm[0] and calls microcontroller.reset() to request the
-# "USB drive on next boot" equivalent of holding BTN_Y. We consume (clear)
-# the flag here so the boot AFTER that returns to normal HID-only mode.
+# UI sets nvm[0] to request MSC on the next boot (equivalent to holding Y).
 NVM_USB_DRIVE_FLAG = 0xA5
 _nvm_request = False
 try:
@@ -26,7 +23,7 @@ try:
 except Exception as _e:
     print("boot: nvm read failed:", _e)
 
-# HORIPAD S HID report descriptor — 86 bytes. Do not edit without re-testing:
+# HORIPAD S HID report descriptor — 86 bytes. Don't edit without re-testing;
 # the Switch validates this against its accepted-gamepad list.
 HORIPAD_REPORT_DESCRIPTOR = bytes((
     0x05, 0x01,        # Usage Page (Generic Desktop)
@@ -83,8 +80,7 @@ gamepad = usb_hid.Device(
 
 usb_hid.enable((gamepad,))
 
-# Switch won't recognize us as a HORIPAD S unless VID/PID match. Without this
-# override, CircuitPython advertises its own VID and the Switch ignores us.
+# Override VID/PID so the Switch recognizes us as HORIPAD S.
 supervisor.set_usb_identification(
     manufacturer=config.USB_MANUFACTURER,
     product=config.USB_PRODUCT,
@@ -92,11 +88,14 @@ supervisor.set_usb_identification(
     pid=config.USB_PID,
 )
 
-# MSC escape hatch: hold BTN_Y while the board is powered on to leave USB
-# mass storage ENABLED for this boot. That makes the CIRCUITPY drive appear
-# on the host so you can drag-drop firmware updates without needing safe mode
-# or the UF2 bootloader. Release the button and reboot to return to normal
-# mode (HTTP-only uploads, runtime filesystem writes re-enabled).
+# Ensure /macros exists so the host sees it as a folder when MSC mounts.
+try:
+    import os
+    os.mkdir("/macros")
+except OSError:
+    pass
+
+# MSC trigger: BTN_Y held, nvm flag set, or /macros is empty.
 import time
 import board
 import digitalio
@@ -106,20 +105,25 @@ try:
     _probe = digitalio.DigitalInOut(getattr(board, config.BTN_Y))
     _probe.direction = digitalio.Direction.INPUT
     _probe.pull = digitalio.Pull.UP
-    time.sleep(0.02)  # settle the pull-up
-    _override = not _probe.value  # active-low
+    time.sleep(0.02)
+    _override = not _probe.value
     _probe.deinit()
 except Exception as _e:
     print("boot: BTN_Y probe failed:", _e)
 
-if _override or _nvm_request:
-    reason = "BTN_Y held" if _override else "nvm flag set"
-    print("boot:", reason, "- USB drive ENABLED")
+_macros_empty = True
+try:
+    import os
+    _files = os.listdir("/macros")
+    _macros_empty = not any(
+        f.endswith(".mz") or f.endswith(".txt") for f in _files
+    )
+except OSError:
+    _macros_empty = True
+
+if _override or _nvm_request or _macros_empty:
+    print("boot: USB drive ENABLED")
 else:
-    # Normal mode: disable MSC so code.py can write to the filesystem at
-    # runtime. Also hides CIRCUITPY from the Switch so it only sees the HID.
     storage.disable_usb_drive()
 
-# Keep CDC console enabled — useful for debugging via serial over USB to a
-# laptop. Switch ignores the CDC interface, so it doesn't affect HID enumeration.
 usb_cdc.enable(console=True, data=False)

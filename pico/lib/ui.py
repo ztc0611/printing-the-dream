@@ -3,8 +3,11 @@
 States:
   GRID     - pick a macro from the list. A=confirm, Y=reboot to USB drive.
   SETUP    - HID passthrough so you can position the cursor on the Switch
-             with the Pico's joystick/buttons. Y=start print, X=back.
+             with the Pico's joystick/buttons. PRINT (joystick click) starts
+             the macro; X returns to GRID.
   RUNNING  - progress bar. B=abort (raises MacroAbort from progress_cb).
+  DONE     - result splash (thumbnail + elapsed time + ntfy status). A
+             returns to GRID.
 
 The display is optional — if display is None (lib missing), UI still runs
 and prints state transitions to the console so the rest of the firmware
@@ -30,6 +33,7 @@ from horipad_hid import BTN, HAT, HAT_NEUTRAL
 STATE_GRID = 0
 STATE_SETUP = 1
 STATE_RUNNING = 2
+STATE_DONE = 3
 
 
 # Magic byte written to microcontroller.nvm[0] by _reboot_to_usb_drive.
@@ -47,10 +51,8 @@ LIST_Y0 = 24
 BTN_X = 186
 BTN_YS = (22, 82, 142, 202)  # aligned with physical A/B/X/Y buttons
 
-# GRID-state thumbnail layout. 2 cols × 2 rows of 72×72 tiles with a
-# macro-name label under each. Convert.py writes <stem>_macro.bmp
-# alongside <stem>_macro.mz; .txt macros have no thumbnail and fall back
-# to a "?" placeholder tile.
+# GRID thumbnails: 2×2 grid of 72×72 tiles. The BMP is embedded at the
+# start of each MZ3 .mz file; .txt macros fall back to a "?" placeholder.
 TILE_SIZE = 72
 TILE_GAP_X = 10
 TILE_GAP_Y = 10
@@ -58,7 +60,8 @@ TILE_LABEL_H = 14
 TILE_COLS = 2
 TILE_ROWS_VIS = 2
 TILE_AREA_W = TILE_COLS * TILE_SIZE + (TILE_COLS - 1) * TILE_GAP_X
-# Left edge of the thumbnail area. 60px reserved on the right for button labels.
+# Left edge of the thumbnail area. 60px reserved on the right for button
+# labels, matches the old list layout.
 TILE_X0 = (config.LCD_WIDTH - 60 - TILE_AREA_W) // 2 + 2
 TILE_Y0 = 24
 TILE_ROW_PITCH = TILE_SIZE + TILE_LABEL_H + TILE_GAP_Y
@@ -77,15 +80,26 @@ COLOR_BG = 0x000000
 COLOR_FG = 0xFFFFFF
 COLOR_DIM = 0x808080
 COLOR_HL_BG = 0x0060C0
+
+# Burn-in protection: after DIM_IDLE_MS without input events, pull backlight
+# to DIM_BRIGHTNESS via ST7789 PWM. The wake press is consumed — requires a
+# full release→press cycle to propagate to the UI below — so tapping the
+# screen on doesn't accidentally abort a running print or select a macro.
+DIM_IDLE_MS = 60_000
+DIM_BRIGHTNESS = 0.08
+FULL_BRIGHTNESS = 1.0
 COLOR_HL_FG = 0xFFFFFF
 COLOR_ACCENT = 0x00FF88
 COLOR_WARN = 0xFFCC00
 COLOR_ERR = 0xFF4040
 
-# Idle-dim thresholds. Wake presses are consumed; release+repress required.
-DIM_IDLE_MS = 60_000
-DIM_BRIGHTNESS = 0.08
-FULL_BRIGHTNESS = 1.0
+# Button-label color semantics (mirrors the v2.0 C UI):
+#   PASSTHROUGH (amber) = press goes straight to the Switch via HID
+#   UI          (green) = press drives the Pico UI / navigation
+#   DESTRUCTIVE (red)   = press aborts / cancels in-progress work
+COLOR_BTN_PASSTHROUGH = COLOR_WARN
+COLOR_BTN_UI = COLOR_ACCENT
+COLOR_BTN_DESTRUCTIVE = COLOR_ERR
 
 
 class MacroAbort(Exception):
@@ -104,6 +118,14 @@ class UI:
         self.selected = 0
         self.scroll = 0
         self.status_text = ""
+        # DONE-state result data, populated by _run before _enter(STATE_DONE).
+        # _done_ntfy_state: None = no ntfy attempt (not configured / abort),
+        # "sending" / "sent" / "failed" mid/post-POST.
+        self._done_name = ""
+        self._done_elapsed_s = 0.0
+        self._done_aborted = False
+        self._done_error = None
+        self._done_ntfy_state = None
 
         self._last_activity_ms = time.monotonic_ns() // 1_000_000
         self._dimmed = False
@@ -178,8 +200,12 @@ class UI:
             self._rows.append(lbl)
             root.append(lbl)
 
-        # Progress bar (RUNNING only). fill is the full-width accent bar;
-        # cover is a black rect we slide right to reveal fill from the left.
+        # Progress bar (RUNNING only). Layered:
+        #   _bar_fill   — solid green bar (revealed left-to-right by cover)
+        #   _bar_cover  — black rect, x-slides right as pct climbs
+        #   _bar_border — 1px green outline on top, always visible. Visible
+        #                  at 0% (empty frame), invisible at 100% (sits over
+        #                  the matching-color fill). Matches the C build.
         fill_bmp = displayio.Bitmap(BAR_W, BAR_H, 1)
         fill_pal = displayio.Palette(1)
         fill_pal[0] = COLOR_ACCENT
@@ -195,6 +221,23 @@ class UI:
             cover_bmp, pixel_shader=cover_pal, x=BAR_X, y=BAR_HIDDEN_Y,
         )
         root.append(self._bar_cover)
+
+        # Border bitmap: 1px green frame, transparent middle.
+        border_bmp = displayio.Bitmap(BAR_W, BAR_H, 2)
+        for _bx in range(BAR_W):
+            border_bmp[_bx, 0] = 1
+            border_bmp[_bx, BAR_H - 1] = 1
+        for _by in range(BAR_H):
+            border_bmp[0, _by] = 1
+            border_bmp[BAR_W - 1, _by] = 1
+        border_pal = displayio.Palette(2)
+        border_pal[0] = 0x000000
+        border_pal.make_transparent(0)
+        border_pal[1] = COLOR_ACCENT
+        self._bar_border = displayio.TileGrid(
+            border_bmp, pixel_shader=border_pal, x=BAR_X, y=BAR_HIDDEN_Y,
+        )
+        root.append(self._bar_border)
 
         # SETUP-state preview group: one tile-sized thumbnail rebuilt when
         # the selected macro changes. Off-screen until _render_setup places
@@ -229,6 +272,15 @@ class UI:
     # ------------------------------------------------------------------
     def _enter(self, new_state):
         self.state = new_state
+        # Force the screen awake on every state transition. Without this, a
+        # transition that's not driven by an input event (e.g. macro completes
+        # → DONE) lands while the backlight is dimmed and the user misses it.
+        # Also reset the activity timer so the new state gets a full DIM_IDLE_MS
+        # before re-dimming.
+        if self._dimmed:
+            self._set_brightness(FULL_BRIGHTNESS)
+            self._dimmed = False
+        self._last_activity_ms = time.monotonic_ns() // 1_000_000
         if new_state == STATE_GRID:
             self._refresh_macros()
         elif new_state == STATE_SETUP:
@@ -268,12 +320,16 @@ class UI:
             self._tick_grid(events)
         elif self.state == STATE_SETUP:
             self._tick_setup(events)
+        elif self.state == STATE_DONE:
+            self._tick_done(events)
         # STATE_RUNNING progresses inline inside _run() and doesn't use tick().
 
     def _consume_wake(self, events):
-        """Filter a wake-press (and anything held across the dim/wake edge)
-        out of events, so tapping the display to light it up doesn't also
-        select/abort/pass-through. Release the held key to re-enable."""
+        """Idle-dim + wake-press consumption. Must run on every poll. Returns
+        a filtered events dict — wake presses are stripped so they don't
+        propagate to _tick_grid / progress_cb / cancel_cb. Also drops any
+        currently-held buttons that were held at wake time until release,
+        matching the _setup_blocked pattern."""
         now_ms = time.monotonic_ns() // 1_000_000
         if events:
             self._last_activity_ms = now_ms
@@ -306,9 +362,15 @@ class UI:
             pass
 
     def _btn_active(self, key):
+        """Held AND not wake-blocked. Use instead of inputs.held.get(...) in
+        callbacks that need to distinguish "still-held wake press" from a
+        real subsequent press."""
         return self.inputs.held.get(key) and key not in self._wake_blocked
 
     def _masked_held(self, held):
+        """held dict with wake-blocked keys forced to False. Pass this to
+        _hat_from_held so a joystick direction held across the dim/wake
+        boundary doesn't leak into HID passthrough until released."""
         if not self._wake_blocked:
             return held
         return {k: (v and k not in self._wake_blocked) for k, v in held.items()}
@@ -369,6 +431,13 @@ class UI:
             self._last_passthrough = None
             self._run()
 
+    def _tick_done(self, events):
+        # A or CTRL returns to the macro grid. Other inputs ignored — the
+        # screen sits on the result until the user acknowledges, which is
+        # also why ntfy fires here (sync) instead of as a background task.
+        if "A" in events or "CTRL" in events:
+            self._enter(STATE_GRID)
+
     def _reboot_to_usb_drive(self):
         """Set NVM flag + hard reset. boot.py reads the flag on the next
         boot, enables USB mass storage, and clears it — so the boot after
@@ -381,13 +450,9 @@ class UI:
             self.status_text = "nvm write failed"
             self._render()
             return
-        self._render_rebooting()
-        if self.display is not None:
-            try:
-                self.display.refresh()
-            except Exception:
-                pass
-        time.sleep(0.5)
+        # Skip the "Rebooting..." splash — it flashes for under a second and
+        # is unreadable. Soft-reset immediately; boot.py shows the proper
+        # "File Import Mode" splash within ~1s of the reset.
         microcontroller.reset()
 
     # ------------------------------------------------------------------
@@ -470,16 +535,55 @@ class UI:
         t0 = time.monotonic()
         if display is not None:
             display.auto_refresh = False
+        elapsed_s = 0.0
+        aborted = False
+        error = None
         try:
             macro_runner.run_macro(self.pad, path, progress_cb, cancel_cb)
             elapsed_s = time.monotonic() - t0
-            # Post-completion notification. Runs here (not inside run_macro)
-            # so the UI can swap the status text during the 2-5s wifi + POST
-            # window. Only fires if the user actually set up secrets.py.
+        except MacroAbort:
+            self.pad.neutral()
+            elapsed_s = time.monotonic() - t0
+            aborted = True
+        except Exception as e:
+            self.pad.neutral()
+            elapsed_s = time.monotonic() - t0
+            error = e
+            print("run_macro error:", repr(e))
+            try:
+                import sys
+                sys.print_exception(e)
+            except Exception as te:
+                print("sys.print_exception failed:", repr(te))
+        finally:
+            if display is not None:
+                display.auto_refresh = True
+
+        # Stash the result for _render_done and enter DONE. The DONE screen
+        # shows the macro's thumbnail + elapsed + colored title + an ntfy
+        # status line that updates in-band as the POST completes.
+        self._done_name = name
+        self._done_elapsed_s = elapsed_s
+        self._done_aborted = aborted
+        self._done_error = error
+        self._done_ntfy_state = None
+        self._enter(STATE_DONE)
+        if display is not None:
+            try:
+                display.refresh()
+            except Exception:
+                pass
+
+        # ntfy: only on success, only when configured. Drive the status line
+        # by mutating _done_ntfy_state + re-rendering between calls so the
+        # user sees "Sending notification..." → "sent"/"failed" on the DONE
+        # screen instead of a frozen "Sending..." for the 2-5s POST window.
+        if not aborted and error is None:
             try:
                 import ntfy
                 if ntfy.is_configured():
-                    self._status.text = "Sending notification..."
+                    self._done_ntfy_state = "sending"
+                    self._render_done()
                     if display is not None:
                         try:
                             display.refresh()
@@ -490,37 +594,26 @@ class UI:
                         if stem.endswith(ext):
                             stem = stem[:-len(ext)]
                             break
-                    ntfy.send("Print complete: " + stem,
-                              title="Tomodachi Printer")
+                    body = "Print complete: {} ({})".format(
+                        stem, _format_elapsed(elapsed_s)
+                    )
+                    ok = ntfy.send(body, title="Tomodachi Printer")
+                    self._done_ntfy_state = "sent" if ok else "failed"
+                    self._render_done()
+                    if display is not None:
+                        try:
+                            display.refresh()
+                        except Exception:
+                            pass
             except Exception as e:
                 print("ntfy hook failed:", e)
-            self.status_text = "Done: {} ({:.1f}s)".format(name, elapsed_s)
-        except MacroAbort:
-            self.pad.neutral()
-            self.status_text = "Aborted: " + name
-        except Exception as e:
-            self.pad.neutral()
-            msg = str(e) or repr(e) or type(e).__name__
-            self.status_text = "Error: " + msg
-            print("run_macro error:", repr(e))
-            print("--- traceback attempt ---")
-            try:
-                import traceback
-                traceback.print_exception(e)
-                print("(via traceback)")
-            except Exception as te:
-                print("traceback failed:", repr(te))
-            try:
-                import sys
-                sys.print_exception(e)
-                print("(via sys)")
-            except Exception as te:
-                print("sys.print_exception failed:", repr(te))
-            print("--- end traceback ---")
-        finally:
-            if display is not None:
-                display.auto_refresh = True
-        self._enter(STATE_GRID)
+                self._done_ntfy_state = "failed"
+                self._render_done()
+                if display is not None:
+                    try:
+                        display.refresh()
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------------
     # rendering
@@ -529,12 +622,25 @@ class UI:
         if self.display is None:
             self._render_console()
             return
-        if self.state == STATE_GRID:
-            self._render_grid()
-        elif self.state == STATE_SETUP:
-            self._render_setup()
-        elif self.state == STATE_RUNNING:
-            self._render_running()
+        # Batch all displayio mutations into a single SPI push. With
+        # auto_refresh on, the 60Hz tick pushes partial state mid-mutation
+        # and the user sees a visible wipe across the screen.
+        self.display.auto_refresh = False
+        try:
+            if self.state == STATE_GRID:
+                self._render_grid()
+            elif self.state == STATE_SETUP:
+                self._render_setup()
+            elif self.state == STATE_RUNNING:
+                self._render_running()
+            elif self.state == STATE_DONE:
+                self._render_done()
+            try:
+                self.display.refresh()
+            except Exception:
+                pass
+        finally:
+            self.display.auto_refresh = True
 
     def _render_console(self):
         if self.state == STATE_GRID:
@@ -543,11 +649,22 @@ class UI:
             print("[SETUP]")
         elif self.state == STATE_RUNNING:
             print("[RUNNING]", self.status_text)
+        elif self.state == STATE_DONE:
+            print("[DONE]", self._done_name,
+                  "aborted" if self._done_aborted else "ok",
+                  "{:.1f}s".format(self._done_elapsed_s))
 
     def _set_buttons(self, a, b, x, y):
-        labels = (a, b, x, y)
-        for i, t in enumerate(labels):
-            self._btns[i].text = t
+        """Set the four button labels. Each arg is either a string (default
+        white) or a (text, color) tuple — passthrough/UI/destructive
+        coloring uses the COLOR_BTN_* constants above."""
+        for i, item in enumerate((a, b, x, y)):
+            if isinstance(item, tuple):
+                text, color = item
+            else:
+                text, color = item, COLOR_FG
+            self._btns[i].text = text
+            self._btns[i].color = color
 
     def _render_grid(self):
         self._title.text = "Tomodachi Print"
@@ -570,7 +687,7 @@ class UI:
             self._grid_hl.y = -200
             self._status.text = self.status_text or "No macros. Press Y to import."
             self._status.color = COLOR_DIM
-            self._set_buttons("", "", "", "IMPORT")
+            self._set_buttons("", "", "", ("IMPORT", COLOR_BTN_UI))
             return
 
         first = self.scroll * TILE_COLS
@@ -609,17 +726,22 @@ class UI:
             self.selected + 1, len(self.macros),
         )
         self._status.color = COLOR_DIM
-        self._set_buttons("run", "", "", "IMPORT")
+        self._set_buttons(
+            ("RUN", COLOR_BTN_UI), "", "", ("IMPORT", COLOR_BTN_UI)
+        )
 
     def _populate_slot(self, slot, macro_name, tile_x, tile_y):
         """Build the tile + name label for macro_name into an empty slot
-        Group. Uses an OnDiskBitmap tile if <stem>_macro.bmp exists,
-        otherwise a dim-gray '?' placeholder."""
-        thumb_path = self._thumb_path_for(macro_name)
+        Group. Uses an OnDiskBitmap tile if the .mz file carries an embedded
+        thumbnail (MZ2 format), otherwise a dim-gray '?' placeholder."""
+        thumb_info = self._thumb_info_for(macro_name)
         tile_added = False
-        if thumb_path is not None:
+        if thumb_info is not None:
             try:
-                bmp = displayio.OnDiskBitmap(thumb_path)
+                path, offset, _size = thumb_info
+                f = open(path, "rb")
+                f.seek(offset)
+                bmp = displayio.OnDiskBitmap(f)
                 slot.append(displayio.TileGrid(
                     bmp, pixel_shader=bmp.pixel_shader, x=tile_x, y=tile_y,
                 ))
@@ -658,22 +780,36 @@ class UI:
             ),
         ))
 
-    def _thumb_path_for(self, macro_name):
-        """Map 'chopper_macro.mz' → '/macros/chopper_macro.bmp'. Returns None
-        if no such file exists (so callers render the placeholder)."""
-        if macro_name.endswith(".mz"):
-            base = macro_name[:-3]
-        elif macro_name.endswith(".txt"):
+    def _thumb_info_for(self, macro_name):
+        """Return (path, bmp_offset, bmp_size) for a .mz file's embedded
+        thumbnail, or None if no thumbnail is available.
+
+        MZ3 layout puts the BMP at offset 0 of the file — bmp_offset is
+        always 0 and OnDiskBitmap can read it directly. (MZ2 used to put
+        the BMP at the end, which broke OnDiskBitmap because that API
+        uses absolute file seeks based on the BMP's bfOffBits — there's
+        no way to point it at an embedded BMP not at offset 0.)
+        """
+        if not macro_name.endswith(".mz"):
             return None  # .txt macros are test macros; no thumbnails.
-        else:
-            base = macro_name
-        path = config.MACRO_DIR + "/" + base + ".bmp"
+        path = config.MACRO_DIR + "/" + macro_name
         try:
-            import os as _os
-            _os.stat(path)
-            return path
+            with open(path, "rb") as _hf:
+                sniff = _hf.read(6)
         except OSError:
             return None
+        if len(sniff) < 6:
+            return None
+        if sniff[0] == 0x42 and sniff[1] == 0x4D:
+            # MZ3: BMP at offset 0, size = BMP's bfSize.
+            bmp_size = sniff[2] | (sniff[3] << 8) | (sniff[4] << 16) | (sniff[5] << 24)
+            if bmp_size == 0:
+                return None
+            return (path, 0, bmp_size)
+        # Legacy MZ2 thumbnails can't be loaded (OnDiskBitmap can't seek to
+        # an embedded BMP). Repack the .mz via convert.py to get the MZ3
+        # layout if you want the thumbnail back.
+        return None
 
     def _hide_thumbs(self):
         if self.display is None:
@@ -699,26 +835,34 @@ class UI:
             display_name = display_name[:-4]
         if display_name.endswith("_macro"):
             display_name = display_name[:-6]
-        est = _read_macro_estimate(config.MACRO_DIR + "/" + name) if name else None
+        macro_path = config.MACRO_DIR + "/" + name if name else None
+        est = _read_macro_estimate(macro_path) if macro_path else None
         if est is None:
             est_str = "Est. time: unknown"
         elif est >= 60:
             est_str = "Est. time: {}m{:02d}s".format(int(est) // 60, int(est) % 60)
         else:
             est_str = "Est. time: {}s".format(int(est))
+        bucket_str = ""
+        if macro_path:
+            _, uses_bucket = _read_macro_brush(macro_path)
+            if uses_bucket:
+                bucket_str = "Uses paint bucket"
         lines = (
             "Joystick = D-pad",
             "Joystick click = X",
             "",
             "Selected: " + display_name,
             est_str,
+            bucket_str,
         )
         for i, lbl in enumerate(self._rows):
             lbl.text = lines[i] if i < len(lines) else ""
             lbl.color = COLOR_FG
-        # Thumbnail below the "Selected:" line, centered in the left area.
+        # Thumbnail below the est-time / bucket line area, centered in the
+        # left half (240px wide minus the 60px button column).
         preview_x = (config.LCD_WIDTH - 60 - TILE_SIZE) // 2
-        preview_y = LIST_Y0 + 5 * LIST_ROW_H + 16
+        preview_y = LIST_Y0 + 6 * LIST_ROW_H + 12
         if self._setup_preview_last != name:
             while len(self._setup_preview) > 0:
                 self._setup_preview.pop()
@@ -728,13 +872,19 @@ class UI:
         self._hide_bar()
         self._status.text = "passthrough HID active"
         self._status.color = COLOR_WARN
-        self._set_buttons("A", "B", "back", "START")
+        self._set_buttons(
+            ("A", COLOR_BTN_PASSTHROUGH), ("B", COLOR_BTN_PASSTHROUGH),
+            ("BACK", COLOR_BTN_UI), ("PRINT", COLOR_BTN_UI),
+        )
 
     def _populate_preview(self, macro_name, x, y):
-        thumb_path = self._thumb_path_for(macro_name)
-        if thumb_path is not None:
+        thumb_info = self._thumb_info_for(macro_name)
+        if thumb_info is not None:
             try:
-                bmp = displayio.OnDiskBitmap(thumb_path)
+                path, offset, _size = thumb_info
+                f = open(path, "rb")
+                f.seek(offset)
+                bmp = displayio.OnDiskBitmap(f)
                 self._setup_preview.append(displayio.TileGrid(
                     bmp, pixel_shader=bmp.pixel_shader, x=x, y=y,
                 ))
@@ -786,7 +936,73 @@ class UI:
         est = getattr(self, "_est_total_sec", None)
         self._status.text = _format_eta(est, 0.0) if est is not None else ""
         self._status.color = COLOR_WARN
-        self._set_buttons("", "STOP", "", "pause")
+        self._set_buttons(
+            "", ("STOP", COLOR_BTN_DESTRUCTIVE), "", ("pause", COLOR_BTN_UI)
+        )
+
+    def _render_done(self):
+        """Result splash: macro name, elapsed time, thumbnail, ntfy status.
+        Title is green on success, red on abort/error. _run mutates
+        _done_ntfy_state and re-calls this between the POST start/end so the
+        user sees the notification progress in-band."""
+        if self.display is None:
+            return
+        self._hide_thumbs()
+        self._hide_highlight()
+        self._hide_bar()
+        for lbl in self._rows:
+            lbl.text = ""
+
+        if self._done_error is not None:
+            self._title.text = "ERROR"
+            self._title.color = COLOR_ERR
+        elif self._done_aborted:
+            self._title.text = "ABORTED"
+            self._title.color = COLOR_ERR
+        else:
+            self._title.text = "DONE"
+            self._title.color = COLOR_ACCENT
+
+        name = self._done_name
+        for ext in (".mz", ".txt"):
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+                break
+        self._rows[0].text = name
+        self._rows[0].color = COLOR_FG
+        self._rows[2].text = _format_elapsed(self._done_elapsed_s)
+        self._rows[2].color = COLOR_DIM
+
+        if self._done_error is not None:
+            self._rows[4].text = "error:"
+            self._rows[4].color = COLOR_ERR
+            msg = str(self._done_error) or type(self._done_error).__name__
+            if len(msg) > 28:
+                msg = msg[:28]
+            self._rows[5].text = msg
+            self._rows[5].color = COLOR_ERR
+
+        preview_x = (config.LCD_WIDTH - 60 - TILE_SIZE) // 2
+        preview_y = LIST_Y0 + 6 * LIST_ROW_H + 12
+        while len(self._setup_preview) > 0:
+            self._setup_preview.pop()
+        self._populate_preview(self._done_name, preview_x, preview_y)
+        self._setup_preview_last = None
+
+        if self._done_ntfy_state == "sending":
+            self._status.text = "Sending notification..."
+            self._status.color = COLOR_WARN
+        elif self._done_ntfy_state == "sent":
+            self._status.text = "Notification sent"
+            self._status.color = COLOR_ACCENT
+        elif self._done_ntfy_state == "failed":
+            self._status.text = "Notification failed"
+            self._status.color = COLOR_ERR
+        else:
+            self._status.text = "press A to return"
+            self._status.color = COLOR_DIM
+
+        self._set_buttons(("OK", COLOR_BTN_UI), "", "", "")
 
     def _render_paused(self):
         if self.display is None:
@@ -810,7 +1026,10 @@ class UI:
         self._hide_bar()
         self._status.text = "Y=resume  X=screenshot"
         self._status.color = COLOR_WARN
-        self._set_buttons("A", "B", "screenshot", "resume")
+        self._set_buttons(
+            ("A", COLOR_BTN_PASSTHROUGH), ("B", COLOR_BTN_PASSTHROUGH),
+            ("screenshot", COLOR_BTN_UI), ("resume", COLOR_BTN_UI),
+        )
 
     def _run_pause(self, elapsed_at_pause=0.0, last_i=0, last_total=0):
         """Blocking pause loop: HID passthrough from Pico inputs to Switch,
@@ -907,7 +1126,7 @@ class UI:
         return time.monotonic_ns() - pause_start_ns
 
     def _render_preparing(self, name, path):
-        brush = _read_macro_brush(path)
+        brush, _ = _read_macro_brush(path)
         if self.display is None:
             print("[PREPARING]", name, "brush=", brush)
             return
@@ -936,15 +1155,33 @@ class UI:
         # time because REPEAT opcodes are 2 bytes but span seconds, and PAUSE
         # opcodes are 3 bytes for any duration — so a byte-based % appears to
         # race ahead of the countdown even though neither is "wrong".
+        #
+        # Label.text assignment in displayio rebuilds the glyph bitmap every
+        # time, even when the string is identical. Over an 80+ minute print
+        # that's hundreds of thousands of allocations and is the dominant
+        # source of heap pressure / GC dumps that corrupt late-print presses.
+        # Cache the last-displayed strings and skip assigns when nothing has
+        # changed. Bar position is cheap and can update every call.
         est = getattr(self, "_est_total_sec", None)
         done = (i >= total) if total else False
         if est is not None and est > 0:
             frac = 1.0 if done else min(1.0, elapsed / est)
-            self._status.text = _format_eta(est, elapsed)
+            new_eta = _format_eta(est, elapsed)
+            if new_eta != getattr(self, "_last_eta_text", None):
+                self._status.text = new_eta
+                self._last_eta_text = new_eta
         else:
             frac = (i / total) if total else 1.0
-        self._rows[2].text = "{:.2f}%".format(frac * 100.0)
-        self._rows[7].text = "{} / {}".format(i, total)
+        new_pct = "{:.0f}%".format(frac * 100.0)
+        if new_pct != getattr(self, "_last_pct_text", None):
+            self._rows[2].text = new_pct
+            self._last_pct_text = new_pct
+        # Count changes every callback (i increments constantly), so the
+        # skip-if-same pattern doesn't help. Throttle to ~1Hz instead.
+        last_count_t = getattr(self, "_last_count_t", 0.0)
+        if elapsed - last_count_t >= 1.0 or done:
+            self._rows[7].text = "{} / {}".format(i, total)
+            self._last_count_t = elapsed
         self._show_bar(frac)
 
     def _show_bar(self, frac):
@@ -956,6 +1193,7 @@ class UI:
             frac = 1.0
         self._bar_fill.y = BAR_Y
         self._bar_cover.y = BAR_Y
+        self._bar_border.y = BAR_Y
         # Cover slides right: at 0% it fully covers fill; at 100% it sits
         # entirely off the right edge of the bar.
         self._bar_cover.x = BAR_X + int(round(frac * BAR_W))
@@ -965,31 +1203,7 @@ class UI:
             return
         self._bar_fill.y = BAR_HIDDEN_Y
         self._bar_cover.y = BAR_HIDDEN_Y
-
-    def _render_rebooting(self):
-        if self.display is None:
-            print("[REBOOTING -> USB DRIVE]")
-            return
-        self._hide_thumbs()
-        self._hide_setup_preview()
-        self._title.text = "Rebooting..."
-        self._title.color = COLOR_WARN
-        for i, lbl in enumerate(self._rows):
-            lbl.text = ""
-        self._rows[0].text = "USB drive mode"
-        self._rows[0].color = COLOR_FG
-        self._rows[2].text = "CIRCUITPY will mount"
-        self._rows[2].color = COLOR_DIM
-        self._rows[3].text = "on your computer."
-        self._rows[3].color = COLOR_DIM
-        self._rows[5].text = "Reboot again to"
-        self._rows[5].color = COLOR_DIM
-        self._rows[6].text = "return to HID mode."
-        self._rows[6].color = COLOR_DIM
-        self._hide_highlight()
-        self._hide_bar()
-        self._status.text = ""
-        self._set_buttons("", "", "", "")
+        self._bar_border.y = BAR_HIDDEN_Y
 
     def _position_highlight(self, y, width, height):
         self._hl.y = y
@@ -1008,37 +1222,82 @@ def _format_eta(est_total_sec, elapsed):
     return "~{}s remaining".format(rem_sec)
 
 
+def _format_elapsed(secs):
+    """Format an elapsed duration for display + ntfy. Drops sub-second
+    detail since the smallest interesting interval is multi-minute."""
+    secs = int(secs)
+    if secs >= 3600:
+        return "{}h {:02d}m {:02d}s".format(
+            secs // 3600, (secs % 3600) // 60, secs % 60
+        )
+    if secs >= 60:
+        return "{}m {:02d}s".format(secs // 60, secs % 60)
+    return "{}s".format(secs)
+
+
 def _read_macro_estimate(path):
-    """Return estimated runtime (seconds) from a .mz file's 8-byte header,
-    or None for headerless files (.txt, bare .mz). Header layout:
-    'MZ1' + version byte + uint32 BE ms."""
+    """Return estimated runtime (seconds) from a .mz file's header.
+
+    MZ3: BMP at offset 0, then 'MZ3' + version + estimated_ms BE uint32.
+         Read BMP's bfSize (bytes 2-5 LE) to find the trailer position.
+    MZ1/MZ2 (legacy): 'MZ1'/'MZ2' + version byte + uint32 BE ms at the top.
+    """
     try:
         with open(path, "rb") as f:
-            hdr = f.read(8)
+            sniff = f.read(6)
+            if len(sniff) < 6:
+                return None
+            if sniff[0] == 0x42 and sniff[1] == 0x4D:
+                # MZ3
+                bmp_size = (sniff[2] | (sniff[3] << 8)
+                            | (sniff[4] << 16) | (sniff[5] << 24))
+                f.seek(bmp_size)
+                trail = f.read(8)
+                if (len(trail) >= 8 and trail[0] == 0x4D
+                        and trail[1] == 0x5A and trail[2] == 0x33):
+                    ms = (trail[4] << 24) | (trail[5] << 16) | (trail[6] << 8) | trail[7]
+                    return ms / 1000.0
+                return None
+            if sniff[0] == 0x4D and sniff[1] == 0x5A and sniff[2] in (0x31, 0x32):
+                # MZ1 / MZ2
+                hdr = sniff + f.read(2)
+                if len(hdr) >= 8:
+                    ms = (hdr[4] << 24) | (hdr[5] << 16) | (hdr[6] << 8) | hdr[7]
+                    return ms / 1000.0
     except OSError:
         return None
-    if (len(hdr) >= 8 and hdr[0] == 0x4D and hdr[1] == 0x5A
-            and hdr[2] == 0x31):
-        ms = (hdr[4] << 24) | (hdr[5] << 16) | (hdr[6] << 8) | hdr[7]
-        return ms / 1000.0
     return None
 
 
-_BRUSH_BY_VERSION = {0x01: "1x1", 0x02: "3x3", 0x03: "plus"}
+_BRUSH_BY_VERSION = {0x01: "1x1", 0x02: "3x3", 0x03: "plus", 0x04: "7x7"}
 
 
 def _read_macro_brush(path):
-    """Return the preamble's target brush ('1x1', '3x3', 'plus') based on the
-    .mz header version byte. Defaults to '1x1' for headerless/missing files."""
+    """Return (preamble_brush, uses_bucket) from the .mz file's version byte.
+    Low nibble selects the preamble brush; high bit (0x80) flags that the
+    macro emits paint-bucket fills. Handles MZ1/MZ2 (header first) and MZ3
+    (BMP first, trailer after)."""
     try:
         with open(path, "rb") as f:
-            hdr = f.read(4)
+            sniff = f.read(6)
+            if len(sniff) < 6:
+                return "1x1", False
+            if sniff[0] == 0x42 and sniff[1] == 0x4D:
+                bmp_size = (sniff[2] | (sniff[3] << 8)
+                            | (sniff[4] << 16) | (sniff[5] << 24))
+                f.seek(bmp_size)
+                trail = f.read(4)
+                if (len(trail) >= 4 and trail[0] == 0x4D
+                        and trail[1] == 0x5A and trail[2] == 0x33):
+                    brush = _BRUSH_BY_VERSION.get(trail[3] & 0x0F, "1x1")
+                    return brush, bool(trail[3] & 0x80)
+                return "1x1", False
+            if sniff[0] == 0x4D and sniff[1] == 0x5A and sniff[2] in (0x31, 0x32):
+                brush = _BRUSH_BY_VERSION.get(sniff[3] & 0x0F, "1x1")
+                return brush, bool(sniff[3] & 0x80)
     except OSError:
-        return "1x1"
-    if (len(hdr) >= 4 and hdr[0] == 0x4D and hdr[1] == 0x5A
-            and hdr[2] == 0x31):
-        return _BRUSH_BY_VERSION.get(hdr[3], "1x1")
-    return "1x1"
+        return "1x1", False
+    return "1x1", False
 
 
 def _hat_from_held(held):
